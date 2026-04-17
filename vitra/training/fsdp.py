@@ -432,6 +432,7 @@ class VLAFSDPStrategy(TrainingStrategy):
         start_epoch: int = 0,
         start_global_step: int = 0,
         save_full_model: bool = True,
+        save_checkpoint: bool = True,
     ) -> None:
         """Run the VLA training loop for the given dataloader; log losses and action metrics to metrics."""
         vla_dataset = dataloader.dataset
@@ -517,9 +518,11 @@ class VLAFSDPStrategy(TrainingStrategy):
                         status = metrics.push()
 
                         # Check for Save Interval or Max Steps & Save Checkpoint
-                        if (terminate := (self.max_steps is not None and metrics.global_step >= self.max_steps)) or (
-                            (metrics.global_step % save_interval) == 0
-                        ):
+                        terminate = self.max_steps is not None and metrics.global_step >= self.max_steps
+                        should_save = save_checkpoint and (
+                            terminate or (metrics.global_step % save_interval) == 0
+                        )
+                        if should_save:
                             self.save_checkpoint(
                                 metrics.run_dir, metrics.global_step, epoch, only_trainable=not save_full_model
                             )
@@ -534,7 +537,7 @@ class VLAFSDPStrategy(TrainingStrategy):
                     progress.update()
                     
                 # Save epoch checkpoint if needed
-                if epoch % epoch_save_interval == 0:
+                if save_checkpoint and epoch % epoch_save_interval == 0:
                     self.save_checkpoint(
                         metrics.run_dir, metrics.global_step, epoch, only_trainable=not save_full_model, is_epoch_end=True
                     )

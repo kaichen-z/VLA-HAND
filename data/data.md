@@ -12,6 +12,7 @@ The contents of this folder are as follows:
 - [3. Video Preprocessing](#3-video-preprocessing)
 - [4. Metadata Structure](#4-metadata-structure)
 - [5. Data Visualization](#5-data-visualization)
+- [6. GigaHands Demo Conversion](#6-gigahands-demo-conversion)
 
 ---
 ## 1. Prerequisites
@@ -263,3 +264,56 @@ Note that using ``--render_gradual_traj`` renders the hand trajectory from the c
 
 
 For a more detailed understanding of the metadata, please see ``visualization/visualize_core.py``.
+
+---
+
+## 6. GigaHands Demo Conversion
+
+GigaHands demo data can be converted into the Stage-1 human episode format
+consumed by `FrameDataset(dataset_name="gigahands")`.
+
+Download the five-sequence demo archive:
+
+```bash
+mkdir -p /home/chonghej/GigaHands/dataset
+curl -L \
+  https://g-ad09a0.56197.5898.data.globus.org/gigahands_demo_all.tar.gz \
+  -o /home/chonghej/GigaHands/dataset/gigahands_demo_all.tar.gz
+tar -xzf /home/chonghej/GigaHands/dataset/gigahands_demo_all.tar.gz \
+  -C /home/chonghej/GigaHands/dataset
+```
+
+Convert it to VITRA Stage-1 layout:
+
+```bash
+python data/preprocessing/convert_gigahands_to_vitra_stage1.py \
+  --gigahands_root /home/chonghej/GigaHands/dataset/gigahands_demo_all \
+  --output_root /home/chonghej/GigaHands/dataset/vitra_gigahands_demo \
+  --input_layout demo \
+  --camera brics-odroid-011_cam0 \
+  --min_frames 17 \
+  --min_valid_ratio 0.9 \
+  --write_video
+```
+
+Then compute normalization statistics:
+
+```bash
+python vitra/datasets/calculate_statistics.py \
+  --dataset_folder /home/chonghej/GigaHands/dataset/vitra_gigahands_demo \
+  --dataset_name gigahands \
+  --save_folder /home/chonghej/GigaHands/dataset/vitra_gigahands_demo/Annotation/statistics
+```
+
+The converter writes:
+
+```text
+vitra_gigahands_demo/
+├── Video/GigaHands_root/
+└── Annotation/
+    ├── gigahands/
+    │   ├── episode_frame_index.npz
+    │   ├── conversion_report.json
+    │   └── episodic_annotations/*.npy
+    └── statistics/gigahands_angle_statistics.json
+```

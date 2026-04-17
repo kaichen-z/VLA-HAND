@@ -184,7 +184,24 @@ demo/
 outputs/
 ckpts/
 logs/
-# datasets/
+runs/
+checkpoints/
+datasets/
+dataset/
+data/raw/
+data/processed/
+*.tar
+*.tar.gz
+*.tgz
+*.h5
+*.hdf5
+*.mp4
+*.avi
+*.mov
+*.webm
+*.part
+*.tmp
+*.ckpt
 weights/hawor/checkpoints
 weights/hawor/external
 weights/external/detector.pt

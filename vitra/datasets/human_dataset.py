@@ -330,6 +330,16 @@ class EpisodicDatasetCore(object):
             else:
                 video_path = os.path.join(self.video_root, video_name+'.webm')
             return video_path
+        elif dataset_name == 'GigaHands':
+            if self.clip_len is not None:
+                base, _ = os.path.splitext(video_name)
+                return os.path.join(self.video_root, base + '_part' + str(part_index+1) + '.mp4')
+            return os.path.join(self.video_root, video_name)
+        elif dataset_name == 'OpenTouch':
+            if self.clip_len is not None:
+                base, _ = os.path.splitext(video_name)
+                return os.path.join(self.video_root, base + '_part' + str(part_index+1) + '.mp4')
+            return os.path.join(self.video_root, video_name)
         else:
             raise ValueError(f'Unknown dataset prefix {dataset_name}')
 

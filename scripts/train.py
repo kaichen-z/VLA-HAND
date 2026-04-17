@@ -63,9 +63,11 @@ def experiment(variant):
     # === Weights & Biases Setup ===
     overwatch.info("VITRA VLA Training :: Creating Folders", ctx_level=1)
     wandb_api_key = os.getenv("WANDB_API_KEY")
-    if wandb_api_key is None:
+    wandb_mode = os.getenv("WANDB_MODE", "").lower()
+    if wandb_api_key is not None:
+        wandb.login(key=wandb_api_key)
+    elif wandb_mode not in {"offline", "disabled"}:
         raise ValueError("Please set the WANDB_API_KEY environment variable.")
-    wandb.login(key=wandb_api_key)
  
     # === Directory Setup ===
     os.makedirs(variant["log_root"], exist_ok=True)
@@ -279,6 +281,7 @@ def experiment(variant):
         epoch_save_interval=variant.get("epoch_save_interval", 100000),
         start_global_step=resume_step,
         start_epoch=resume_epoch,
+        save_checkpoint=variant.get("save_checkpoint", True),
     )
 
     # === Training Finalization ===

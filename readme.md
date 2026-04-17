@@ -31,6 +31,7 @@
 ---
 
 ## 🚩 New & Updates
+*   **Local fork workflow:** This fork includes GigaHands real-subset and OpenTouch keypoint pretraining utilities. See [`README_GIGAHANDS_OPENTOUCH.md`](README_GIGAHANDS_OPENTOUCH.md) for data download, conversion, pretraining, and demo/evaluation commands.
 *   **[2026-02-09]** 🚀 Release the finetuning dataset collected by teleoperation.
 *   **[2025-12-05]** 🚀 Release the code for performing zero-shot inference using a single image.
 *   **[2025-11-30]** 🚀 Our code, pretrained models, and datasets are now open-sourced.

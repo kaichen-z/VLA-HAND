@@ -172,11 +172,11 @@ class VITRA_Paligemma(nn.Module):
 
     @property
     def word_embedding(self):
-        return self.model.language_model.model.embed_tokens
+        return self.model.get_input_embeddings()
 
     @property
     def text_tower(self):
-        return self.model.language_model.model
+        return getattr(self.model.language_model, "model", self.model.language_model)
 
     @property
     def vision_tower(self):
@@ -338,9 +338,19 @@ class VITRA_Paligemma(nn.Module):
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
 
-        causal_mask = self.model._update_causal_mask(
-            attention_mask, None, None, cache_position, input_ids, inputs_embeds, False
-        )
+        if hasattr(self.model, "_update_causal_mask"):
+            causal_mask = self.model._update_causal_mask(
+                attention_mask, None, None, cache_position, input_ids, inputs_embeds, False
+            )
+        else:
+            causal_mask = self.model._prepare_4d_causal_attention_mask_with_cache_position(
+                attention_mask=attention_mask,
+                sequence_length=inputs_embeds.shape[1],
+                target_length=inputs_embeds.shape[1],
+                dtype=inputs_embeds.dtype,
+                cache_position=cache_position,
+                batch_size=B,
+            )
         return {
             "attention_mask": causal_mask,
             "position_ids": position_ids,

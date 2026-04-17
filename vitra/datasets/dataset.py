@@ -46,7 +46,7 @@ class FrameDataset(Dataset):
         self.action_type = action_type
         self.rel_mode = rel_mode # 'step'
         training_path = None
-        assert action_type == 'angle' and use_rel == False and rel_mode == 'step', "Please recalculate the statistics and update the path here with other action representations."
+        assert action_type in {"angle", "keypoints"} and use_rel == False and rel_mode == 'step', "Please recalculate the statistics and update the path here with other action representations."
         if dataset_name == 'ego4d_cooking_and_cleaning':
             annotation_file = os.path.join(dataset_folder, "Annotation/ego4d_cooking_and_cleaning/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, "Annotation/ego4d_cooking_and_cleaning/episodic_annotations")
@@ -72,14 +72,31 @@ class FrameDataset(Dataset):
             label_folder = os.path.join(dataset_folder, "Annotation/ego4d_other/episodic_annotations")
             statistics_path = os.path.join(dataset_folder, "Annotation/statistics/ego4d_other_angle_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/Ego4D_root')
+        elif dataset_name == 'gigahands':
+            annotation_file = os.path.join(dataset_folder, "Annotation/gigahands/episode_frame_index.npz")
+            label_folder = os.path.join(dataset_folder, "Annotation/gigahands/episodic_annotations")
+            statistics_path = os.path.join(dataset_folder, "Annotation/statistics/gigahands_angle_statistics.json")
+            video_root = os.path.join(dataset_folder, 'Video/GigaHands_root')
+        elif dataset_name.startswith('gigahands_real_'):
+            annotation_file = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episode_frame_index.npz")
+            label_folder = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episodic_annotations")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{dataset_name}_angle_statistics.json")
+            video_root = os.path.join(dataset_folder, 'Video/GigaHands_root')
+        elif dataset_name.startswith('opentouch_keypoint_'):
+            annotation_file = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episode_frame_index.npz")
+            label_folder = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episodic_annotations")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{dataset_name}_{action_type}_statistics.json")
+            video_root = os.path.join(dataset_folder, 'Video/OpenTouch_root')
         elif dataset_name == 'robo_dataset':
             root_dir = os.path.join(dataset_folder, "TeleData")
             statistics_path = os.path.join(dataset_folder, "teledata_statistics.json")
         else:
             raise ValueError(f"Unknown dataset name: {dataset_name}")
             
+        if not normalization:
+            statistics_path = None
         # Warn if statistics file is missing but images are to be loaded
-        if statistics_path is None or not os.path.exists(statistics_path):
+        elif statistics_path is None or not os.path.exists(statistics_path):
             if load_images:
                 print(f"Warning: statistics file '{statistics_path}' does not exist. Please calculate statistics first if you plan to train a model.")
             else:

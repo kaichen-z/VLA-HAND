@@ -3,7 +3,6 @@ import decord
 from skimage.color import gray2rgb
 import numpy as np
 import torch
-from torchvision import transforms
 from PIL import Image
 import random
 

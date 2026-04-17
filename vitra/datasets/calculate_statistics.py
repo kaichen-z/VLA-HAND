@@ -10,6 +10,16 @@ from vitra.utils.config_utils import load_config
 from vitra.datasets.dataset import FrameDataset
 
 
+def mean_std_or_default(values, fallback_dim, mean_default=0.0, std_default=1.0):
+    if len(values) == 0:
+        return (
+            np.full(fallback_dim, mean_default, dtype=np.float32),
+            np.full(fallback_dim, std_default, dtype=np.float32),
+        )
+    arr = np.asarray(values, dtype=np.float32)
+    return np.mean(arr, axis=0), np.std(arr, axis=0)
+
+
 def compute_statistics(dataset, num_workers=16, batch_size=128, save_folder='./'):
     """
     Compute mean and standard deviation of the 'state' in the dataset using multi-threading.
@@ -44,18 +54,12 @@ def compute_statistics(dataset, num_workers=16, batch_size=128, save_folder='./'
         train_num += batch['current_state'].shape[0]
     
     del dataloader
-    action_right_np = np.array(action_right_list)
-    state_right_np = np.array(state_right_list)
-    action_left_np = np.array(action_left_list)
-    state_left_np = np.array(state_left_list)
-    action_left_mean = np.mean(action_left_np, axis=0)
-    action_left_std = np.std(action_left_np, axis=0)
-    state_left_mean = np.mean(state_left_np, axis=0)
-    state_left_std = np.std(state_left_np, axis=0)
-    action_right_mean = np.mean(action_right_np, axis=0)
-    action_right_std = np.std(action_right_np, axis=0)
-    state_right_mean = np.mean(state_right_np, axis=0)
-    state_right_std = np.std(state_right_np, axis=0)
+    action_dim = len(action_right_list[0]) if action_right_list else len(action_left_list[0])
+    state_dim = len(state_right_list[0]) if state_right_list else len(state_left_list[0])
+    action_left_mean, action_left_std = mean_std_or_default(action_left_list, action_dim)
+    state_left_mean, state_left_std = mean_std_or_default(state_left_list, state_dim)
+    action_right_mean, action_right_std = mean_std_or_default(action_right_list, action_dim)
+    state_right_mean, state_right_std = mean_std_or_default(state_right_list, state_dim)
 
     my_dict = {
         'dataset_name': f"{dataset.dataset_name}_{dataset.action_type}_statistics.json",
@@ -79,7 +83,7 @@ if __name__=='__main__':
                         default="/home/t-qixiuli/eai_blob/hand_pretrain_prepare",
                         help='Path to the dataset folder')
     parser.add_argument('--dataset_name', type=str, default='all',
-                        help='Name of the dataset (ego4d, egoexo4d, epic, ssv2, ego4d_beyond, all)')
+                        help='Name of the dataset (ego4d, egoexo4d, epic, ssv2, ego4d_beyond, gigahands, all)')
 
     # Augmentation parameters
     parser.add_argument('--augmentation', action='store_true', default=True,
@@ -115,7 +119,7 @@ if __name__=='__main__':
 
     args = parser.parse_args()
     if args.dataset_name == 'all':
-        for dataset_name in ['ego4d_cooking_and_cleaning', 'egoexo4d', 'epic', 'ssv2', 'ego4d_other']:
+        for dataset_name in ['ego4d_cooking_and_cleaning', 'egoexo4d', 'epic', 'ssv2', 'ego4d_other', 'gigahands', 'gigahands_real_train', 'gigahands_real_test', 'opentouch_keypoint_train', 'opentouch_keypoint_test']:
             print(f"Calculating statistics for dataset: {dataset_name}")
             dataset = FrameDataset(
                 dataset_folder=args.dataset_folder, 
