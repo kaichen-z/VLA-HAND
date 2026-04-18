@@ -144,6 +144,7 @@ def build_candidates(
     prefer_camera: str,
     require_both_hands_valid: bool,
     prefer_bimanual_motion: bool,
+    require_video_exists: bool,
     target_candidates: int | None = None,
 ) -> list[dict[str, Any]]:
     annotations_path = gigahands_root / "annotations_v2.jsonl"
@@ -155,6 +156,7 @@ def build_candidates(
 
     video_map = load_video_map(gigahands_root / "multiview_camera_video_map.csv")
     candidates = []
+    seen_clip_keys: set[tuple[str, str, str, int, int, str]] = set()
     for row in iter_annotation_rows(annotations_path):
         raw_text = row.get("rewritten_annotation") or row.get("clarify_annotation") or ""
         if isinstance(raw_text, list):
@@ -181,6 +183,17 @@ def build_candidates(
         map_rows = video_map.get((scene, sequence_id), [])
         camera = choose_camera(gigahands_root, scene, sequence_id, prefer_camera, map_rows)
         video_path = infer_video_path(gigahands_root, scene, sequence_id, camera, map_rows)
+        if require_video_exists and not video_path.exists():
+            continue
+        video_rel = (
+            str(video_path.relative_to(gigahands_root))
+            if not video_path.is_absolute() or video_path.is_relative_to(gigahands_root)
+            else str(video_path)
+        )
+        clip_key = (scene, sequence_id, camera, start, end, video_rel)
+        if clip_key in seen_clip_keys:
+            continue
+        seen_clip_keys.add(clip_key)
         clip = {
             "clip_id": f"{scene}_{sequence_id}",
             "scene": scene,
@@ -193,7 +206,7 @@ def build_candidates(
             "bimanual_motion": bimanual_motion,
             "params_path": str(params_path.relative_to(gigahands_root)),
             "camera_path": str((gigahands_root / "hand_poses" / scene / "optim_params.txt").relative_to(gigahands_root)),
-            "video_path": str(video_path.relative_to(gigahands_root)) if not video_path.is_absolute() or video_path.is_relative_to(gigahands_root) else str(video_path),
+            "video_path": video_rel,
         }
         candidates.append(clip)
         if target_candidates is not None and len(candidates) >= target_candidates:
@@ -250,6 +263,7 @@ def prepare_real_subset(
     prefer_camera: str,
     require_both_hands_valid: bool,
     prefer_bimanual_motion: bool,
+    require_video_exists: bool,
     output_manifest: str | Path,
     output_video_list: str | Path,
     candidate_pool_factor: int = 4,
@@ -264,9 +278,15 @@ def prepare_real_subset(
         prefer_camera=prefer_camera,
         require_both_hands_valid=require_both_hands_valid,
         prefer_bimanual_motion=prefer_bimanual_motion,
+        require_video_exists=require_video_exists,
         target_candidates=max(num_train + num_test, (num_train + num_test) * candidate_pool_factor),
     )
     selected = candidates[: num_train + num_test]
+    if len(selected) < num_train + num_test:
+        raise ValueError(
+            f"Only found {len(selected)} eligible clips, but requested {num_train + num_test}. "
+            "Try lowering NUM_TRAIN/NUM_TEST/MIN_FRAMES, changing CAMERA, or disabling --require_video_exists."
+        )
     train = selected[:num_train]
     test = selected[num_train : num_train + num_test]
     for clip in train:
@@ -286,6 +306,7 @@ def prepare_real_subset(
             "prefer_camera": prefer_camera,
             "require_both_hands_valid": require_both_hands_valid,
             "prefer_bimanual_motion": prefer_bimanual_motion,
+            "require_video_exists": require_video_exists,
             "candidate_pool_factor": candidate_pool_factor,
         },
         "splits": {
@@ -318,6 +339,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefer_camera", default="brics-odroid-011_cam0")
     parser.add_argument("--require_both_hands_valid", action="store_true")
     parser.add_argument("--prefer_bimanual_motion", action="store_true")
+    parser.add_argument("--require_video_exists", action="store_true")
     parser.add_argument("--candidate_pool_factor", type=int, default=4)
     parser.add_argument("--output_manifest", type=Path, required=True)
     parser.add_argument("--output_video_list", type=Path, required=True)
@@ -334,6 +356,7 @@ def main() -> None:
         prefer_camera=args.prefer_camera,
         require_both_hands_valid=args.require_both_hands_valid,
         prefer_bimanual_motion=args.prefer_bimanual_motion,
+        require_video_exists=args.require_video_exists,
         output_manifest=args.output_manifest,
         output_video_list=args.output_video_list,
         candidate_pool_factor=args.candidate_pool_factor,

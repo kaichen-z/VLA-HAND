@@ -16,6 +16,7 @@ NUM_TEST="${NUM_TEST:-5}"
 MIN_FRAMES="${MIN_FRAMES:-32}"
 CAMERA="${CAMERA:-brics-odroid-011_cam0}"
 CANDIDATE_POOL_FACTOR="${CANDIDATE_POOL_FACTOR:-4}"
+REQUIRE_VIDEO_EXISTS="${REQUIRE_VIDEO_EXISTS:-0}"
 STAGE="${STAGE:-help}"
 
 cd "${REPO_ROOT}"
@@ -46,7 +47,8 @@ prepare_subset() {
     --prefer_bimanual_motion \
     --candidate_pool_factor "${CANDIDATE_POOL_FACTOR}" \
     --output_manifest "${GIGAHANDS_ROOT}/subset_manifest.json" \
-    --output_video_list "${GIGAHANDS_ROOT}/needed_videos.txt"
+    --output_video_list "${GIGAHANDS_ROOT}/needed_videos.txt" \
+    $(if [[ "${REQUIRE_VIDEO_EXISTS}" == "1" ]]; then echo "--require_video_exists"; fi)
   make_unique_video_list
   echo "Download the RGB videos listed in ${GIGAHANDS_ROOT}/needed_videos_unique.txt into ${GIGAHANDS_ROOT}/multiview_rgb_vids before running STAGE=convert."
 }
@@ -96,7 +98,8 @@ train_smoke() {
     --batch_size 1 \
     --total_batch_size "${NPROC}" \
     --max_steps 5 \
-    --num_workers 0
+    --num_workers 0 \
+    --no_save_checkpoint
 }
 
 train_small() {
@@ -107,6 +110,7 @@ train_small() {
     --batch_size 1 \
     --total_batch_size "${NPROC}" \
     --max_steps "${MAX_STEPS:-500}" \
+    --save_steps "${SAVE_STEPS:-100}" \
     --num_workers "${NUM_WORKERS:-2}"
 }
 

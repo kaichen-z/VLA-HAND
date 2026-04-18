@@ -51,7 +51,14 @@ class DistributedOverwatch:
 
         # Note that PartialState is always safe to initialize regardless of `accelerate launch` or `torchrun`
         #   =>> However, might be worth actually figuring out if we need the `accelerate` dependency at all!
-        self.logger, self.distributed_state = ContextAdapter(logging.getLogger(name), extra={}), PartialState()
+        partial_state_kwargs = {}
+        dist_backend = os.environ.get("DIST_BACKEND")
+        if dist_backend:
+            partial_state_kwargs["backend"] = dist_backend
+        self.logger, self.distributed_state = (
+            ContextAdapter(logging.getLogger(name), extra={}),
+            PartialState(**partial_state_kwargs),
+        )
 
         # Logger Delegation (for convenience; would be nice to just compose & dynamic dispatch eventually)
         self.debug = self.logger.debug

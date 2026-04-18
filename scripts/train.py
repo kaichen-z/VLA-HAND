@@ -45,6 +45,13 @@ torch.backends.cudnn.allow_tf32 = True
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
+def distributed_barrier(device_id: int) -> None:
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        if dist.get_backend() == "nccl":
+            dist.barrier(device_ids=[device_id])
+        else:
+            dist.barrier()
+
 def experiment(variant):
     """
     Main training experiment function for VITRA VLA models.
@@ -107,7 +114,7 @@ def experiment(variant):
         overwatch.info(f"Config saved to {checkpoint_dir}", ctx_level=1)
         print(json.dumps(copied_variant, indent=2))
 
-    dist.barrier()
+    distributed_barrier(device_id)
     
     # === Model Loading and Checkpoint Resume ===
     overwatch.info("Loading model", ctx_level=1)
@@ -290,7 +297,7 @@ def experiment(variant):
 
     # === Cleanup ===
     overwatch.info("... and that's all, folks!")
-    dist.barrier()
+    distributed_barrier(device_id)
     dist.destroy_process_group()
 
 def get_fsdp_wrap_policy_and_checkpointing(configs):
@@ -357,6 +364,8 @@ def update_configs(configs, args):
     """
     if args["task_name"] is not None:
         configs["task_name"] = args["task_name"]
+    if args.get("no_save_checkpoint"):
+        configs["save_checkpoint"] = False
     
     configs["use_bf16"] = (
         args["use_bf16"]
@@ -493,6 +502,18 @@ def parse_args():
         type=int,
         help="Number of batches to prefetch per worker"
     )
+    parser.add_argument(
+        "--save_steps",
+        default=None,
+        type=int,
+        help="Checkpoint save interval in optimizer steps"
+    )
+    parser.add_argument(
+        "--no_save_checkpoint",
+        default=False,
+        action="store_true",
+        help="Disable checkpoint writing for short smoke runs"
+    )
     
     # Capture global argument names before adding trainer group
     global_names = set(vars(parser.parse_known_args()[0]).keys())
@@ -548,8 +569,14 @@ if __name__ == "__main__":
     configs = load_config(args.get("config"))
     configs = update_configs(configs, args)
     
-    # Initialize distributed training backend (NCCL for NVIDIA GPUs)
+    # Initialize distributed training backend.
+    dist_backend = os.environ.get("DIST_BACKEND", "nccl")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
+        init_kwargs = {"backend": dist_backend}
+        if dist_backend == "nccl" and torch.cuda.is_available():
+            init_kwargs["device_id"] = torch.device(f"cuda:{torch.cuda.current_device()}")
+        dist.init_process_group(**init_kwargs)
 
     experiment(variant=configs)

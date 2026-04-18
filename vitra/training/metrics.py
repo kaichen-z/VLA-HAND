@@ -6,6 +6,7 @@ endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
 import time
+import os
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, Optional, Protocol, Tuple, Union
@@ -91,8 +92,9 @@ class WeightsBiasesTracker:
         if overwatch.is_rank_zero():
             wandb.finish()
 
-        # A job gets 210 seconds to get its affairs in order
-        time.sleep(210)
+        finalize_sleep = float(os.getenv("WANDB_FINALIZE_SLEEP", "0"))
+        if finalize_sleep > 0:
+            time.sleep(finalize_sleep)
 
 
 # === Core Metrics Container :: Initializes Trackers => Compiles/Pushes Metrics ===

@@ -509,7 +509,11 @@ def build_episode(source: SourceEpisode, output_root: Path, camera: str, write_v
 
     left = build_hand_dict(sliced_params["left"], None if keypoints is None else keypoints.get("left"), extrinsics)
     right = build_hand_dict(sliced_params["right"], None if keypoints is None else keypoints.get("right"), extrinsics)
-    episode_id = f"GigaHands_{safe_name(source.sequence_name)}_{safe_name(source.sequence_id)}_ep_000000"
+    clip_name = safe_name(source.video_path.stem)
+    episode_id = (
+        f"GigaHands_{safe_name(source.sequence_name)}_{safe_name(source.sequence_id)}_"
+        f"{safe_name(camera_name)}_{clip_name}_f{start:06d}_{end:06d}_ep_000000"
+    )
     instruction = source.instruction
     episode = {
         "video_name": str(rel_video_path),
@@ -592,7 +596,7 @@ def convert_gigahands_to_vitra(
     datasets: dict[str, dict[str, Any]] = {}
     for source in sources:
         dataset_name = dataset_name_for_source(input_layout, dataset_name_prefix, source.split)
-        dataset_state = datasets.setdefault(dataset_name, {"pairs": [], "ids": []})
+        dataset_state = datasets.setdefault(dataset_name, {"pairs": [], "ids": [], "id_set": set()})
         annotation_root = output_root / "Annotation" / dataset_name
         label_root = annotation_root / "episodic_annotations"
         label_root.mkdir(parents=True, exist_ok=True)
@@ -631,6 +635,10 @@ def convert_gigahands_to_vitra(
             continue
 
         episode_index = len(dataset_state["ids"])
+        if episode_id in dataset_state["id_set"]:
+            report["errors"].append({"source": str(source.params_path), "error": f"Duplicate episode_id: {episode_id}"})
+            continue
+        dataset_state["id_set"].add(episode_id)
         dataset_state["ids"].append(episode_id)
         dataset_state["pairs"].extend((episode_index, frame_id) for frame_id in range(frame_count))
         np.save(label_root / f"{episode_id}.npy", episode, allow_pickle=True)

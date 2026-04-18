@@ -45,6 +45,26 @@ from vitra.utils.overwatch import initialize_overwatch
 overwatch = initialize_overwatch(__name__)  
 
 
+def distributed_barrier() -> None:
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
+
+
+def move_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {k: move_to_device(v, device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [move_to_device(v, device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(move_to_device(v, device) for v in value)
+    return value
+
+
 def get_constant_schedule_with_freeze_warmup(
     optimizer: torch.optim.Optimizer,
     num_warmup_steps: int,
@@ -168,6 +188,7 @@ class VLAFSDPStrategy(TrainingStrategy):
         self.optimizer_betas = optimizer_betas
 
         # FSDP-specific parameters
+        self.use_fsdp = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
         if sharding_strategy == "shard-grad-op":
             self.fsdp_sharding_strategy = ShardingStrategy._HYBRID_SHARD_ZERO2
         elif sharding_strategy == "full-shard":
@@ -189,7 +210,6 @@ class VLAFSDPStrategy(TrainingStrategy):
         is_epoch_end: bool = False,
     ) -> None:
         """Save a checkpoint to the `run_dir` only containing the state_dicts for trainable parameters by default."""
-        assert isinstance(self.vla, FSDP), "FSDPStrategy.save_checkpoint assumes VLM is already wrapped in FSDP!"
         if is_epoch_end:
             checkpoint_name = f"epoch={epoch}-step={global_step}.end.ckpt"
         else:
@@ -203,6 +223,19 @@ class VLAFSDPStrategy(TrainingStrategy):
             torch.save(state_dict, path)
             overwatch.info(f"Saving state dict to {path} end at {datetime.now()}")
         
+        if not self.use_fsdp:
+            meta_state = {
+                "epoch": epoch,
+                "global_step": global_step
+            }
+            if overwatch.is_rank_zero():
+                with open(checkpoint_dir / "meta.json", "w") as f:
+                    json.dump(meta_state, f)
+                threading.Thread(target=save_with_time, args=(self.vla.state_dict(), checkpoint_dir / 'weights.pt')).start()
+                threading.Thread(target=save_with_time, args=(self.optimizer.state_dict(), checkpoint_dir / 'optimizer.pt')).start()
+            return
+
+        assert isinstance(self.vla, FSDP), "FSDPStrategy.save_checkpoint assumes VLM is already wrapped in FSDP!"
         # Gather full state dictionary from shards
         with FSDP.state_dict_type(self.vla, self.fsdp_state_dict_type, self.fsdp_save_policy, self.fsdp_save_optimizer_policy):
             overwatch.info("Gathering model state")
@@ -217,12 +250,12 @@ class VLAFSDPStrategy(TrainingStrategy):
             if overwatch.is_rank_zero():
                 with open(checkpoint_dir / "meta.json", "w") as f:
                     json.dump(meta_state, f)
-            dist.barrier()
+            distributed_barrier()
             if overwatch.is_rank_zero():
                 threading.Thread(target=save_with_time, args=(model_state, checkpoint_dir / 'weights.pt')).start()
                 threading.Thread(target=save_with_time, args=(optim_state, checkpoint_dir / 'optimizer.pt')).start()
             
-            dist.barrier()
+            distributed_barrier()
 
     def load_optimizer_and_scheduler(self, checkpoint_folder: str) -> None:
         """Load optimizer and scheduler state from checkpoint."""
@@ -277,19 +310,22 @@ class VLAFSDPStrategy(TrainingStrategy):
                 buffer_dtype=torch.float32
             )
 
-        # <FSDP> => note that FSDP will automatically take care of device placement (similar to `autocast`)
-        self.vla = FSDP(
-            self.vla,
-            auto_wrap_policy=auto_wrap_policy,
-            mixed_precision=fsdp_precision_policy,
-            sharding_strategy=self.fsdp_sharding_strategy,
-            device_id=torch.cuda.current_device(),
-            limit_all_gathers=True,
-            use_orig_params=True,
-        )
-        
+        if self.use_fsdp:
+            # <FSDP> => note that FSDP will automatically take care of device placement (similar to `autocast`)
+            self.vla = FSDP(
+                self.vla,
+                auto_wrap_policy=auto_wrap_policy,
+                mixed_precision=fsdp_precision_policy,
+                sharding_strategy=self.fsdp_sharding_strategy,
+                device_id=torch.cuda.current_device(),
+                limit_all_gathers=True,
+                use_orig_params=True,
+            )
+        else:
+            self.vla = self.vla.to(self.device_id)
+
         # Setup gradient checkpointing
-        if self.enable_gradient_checkpointing:
+        if self.use_fsdp and self.enable_gradient_checkpointing:
             # For Gradient Checkpointing under FSDP --> we make the same assumption as in the DDP/other strategies; the
             #   bulk of activation memory is taken up by the LLM activations. However, unlike other strategies, we
             #   cannot rely on the HF Transformers default `gradient_checkpointing_enable()` --> FSDP breaks semantics!
@@ -305,7 +341,7 @@ class VLAFSDPStrategy(TrainingStrategy):
                 # Note that the terms "activation checkpointing" and "gradient checkpointing" are synonymous!
                 apply_activation_checkpointing(self.vla, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn)
 
-        dist.barrier()
+        distributed_barrier()
 
         # Create Optimizer and LR Scheduler =>> note that most of the LR Schedulers we use require `max_steps/epochs`
         #   => Optimizer should only operate on parameters that are *unfrozen* / trainable!
@@ -421,7 +457,10 @@ class VLAFSDPStrategy(TrainingStrategy):
 
     def clip_grad_norm(self) -> None:
         """Clip gradients using FSDP's built-in gradient clipping."""
-        self.vla.clip_grad_norm_(max_norm=self.max_grad_norm)
+        if self.use_fsdp:
+            self.vla.clip_grad_norm_(max_norm=self.max_grad_norm)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.vla.parameters(), max_norm=self.max_grad_norm)
 
     def run_training(
         self,
@@ -450,6 +489,7 @@ class VLAFSDPStrategy(TrainingStrategy):
                 self.vla.train()
                 self.optimizer.zero_grad()
                 for batch_idx, batch in enumerate(dataloader):
+                    batch = move_to_device(batch, self.device_id)
                     # Note that we'll unpack batch (and let AMP/FSDP do its thing) in the VLM.forward() call
                     #   => Basically, if we're using mixed precision (or not), autocast()/FSDP will move to device!
                     input_ids = batch["input_ids"]
@@ -526,7 +566,7 @@ class VLAFSDPStrategy(TrainingStrategy):
                             self.save_checkpoint(
                                 metrics.run_dir, metrics.global_step, epoch, only_trainable=not save_full_model
                             )
-                            dist.barrier()
+                            distributed_barrier()
 
                         if terminate:
                             return
