@@ -112,8 +112,11 @@ def test_prepare_real_subset_writes_manifest_and_needed_videos(tmp_path):
         min_frames=32,
         prefer_camera="brics-odroid-011_cam0",
         require_both_hands_valid=True,
+        require_keypoints=False,
         prefer_bimanual_motion=True,
         candidate_pool_factor=4,
+        require_video_exists=False,
+        require_video_frame_count=False,
         output_manifest=manifest,
         output_video_list=needed_videos,
     )
@@ -155,8 +158,11 @@ def test_prepare_real_subset_requires_hand_poses(tmp_path):
             min_frames=32,
             prefer_camera="brics-odroid-011_cam0",
             require_both_hands_valid=True,
+            require_keypoints=False,
             prefer_bimanual_motion=True,
             candidate_pool_factor=4,
+            require_video_exists=False,
+            require_video_frame_count=False,
             output_manifest=tmp_path / "subset_manifest.json",
             output_video_list=tmp_path / "needed_videos.txt",
         )
@@ -174,8 +180,11 @@ def test_prepare_real_subset_can_stop_after_small_candidate_pool(tmp_path):
         min_frames=32,
         prefer_camera="brics-odroid-011_cam0",
         require_both_hands_valid=True,
+        require_keypoints=False,
         prefer_bimanual_motion=True,
         candidate_pool_factor=1,
+        require_video_exists=False,
+        require_video_frame_count=False,
         output_manifest=tmp_path / "subset_manifest.json",
         output_video_list=tmp_path / "needed_videos.txt",
     )
@@ -270,6 +279,14 @@ def test_converter_full_manifest_writes_train_and_test_datasets(tmp_path):
     epi = np.load(train_episodes[0], allow_pickle=True).item()
     assert epi["video_name"].startswith("p001-box/brics-odroid-011_cam0/")
     assert epi["text"]["left"][0][0] == "Pick up object 0 with both hands."
+    assert epi["camera"]["name"] == "brics-odroid-011_cam0"
+    assert epi["camera"]["image_size"] == [1280, 720]
+    assert epi["camera"]["undistorted"] is False
+    np.testing.assert_allclose(epi["camera"]["intrinsics"], epi["intrinsics"])
+    np.testing.assert_allclose(epi["camera"]["distortion"], np.zeros(4, dtype=np.float32))
+    assert report["undistorted_requested"] is False
+    assert report["num_raw_copied_videos"] == 2
+    assert report["num_undistorted_videos"] == 0
 
 
 def test_converted_real_train_split_can_be_read_by_frame_dataset_without_images(tmp_path):
@@ -327,6 +344,56 @@ def test_converted_real_train_split_can_be_read_by_frame_dataset_without_images(
     assert item["action_list"].shape == (17, 102)
     assert item["current_state"].shape == (122,)
     assert item["action_mask"].shape == (17, 2)
+
+
+def test_converter_clean_output_removes_previous_managed_files(tmp_path):
+    converter = load_module(CONVERTER_PATH, "convert_gigahands_to_vitra_stage1")
+    root = tmp_path / "GigaHands_subset_real"
+    output_root = tmp_path / "vitra_gigahands_real_subset"
+    write_full_fixture(root, count=1)
+    manifest = {
+        "clips": [
+            {
+                "clip_id": "train_001",
+                "split": "train",
+                "scene": "p001-box",
+                "sequence_id": "001",
+                "camera": "brics-odroid-011_cam0",
+                "instruction": "Pick up object with both hands.",
+                "start_frame": 0,
+                "end_frame": 36,
+                "params_path": "hand_poses/p001-box/params/001.json",
+                "camera_path": "hand_poses/p001-box/optim_params.txt",
+                "video_path": "multiview_rgb_vids/p001-box/brics-odroid-011_cam0/brics-odroid-011_cam0_001.mp4",
+            }
+        ],
+    }
+    manifest_path = root / "subset_manifest.json"
+    manifest_path.write_text(json.dumps(manifest))
+
+    orphan_annotation = output_root / "Annotation" / "old" / "stale.npy"
+    orphan_video = output_root / "Video" / "GigaHands_root" / "old" / "stale.mp4"
+    orphan_annotation.parent.mkdir(parents=True)
+    orphan_video.parent.mkdir(parents=True)
+    orphan_annotation.write_bytes(b"stale")
+    orphan_video.write_bytes(b"stale")
+
+    converter.convert_gigahands_to_vitra(
+        gigahands_root=root,
+        output_root=output_root,
+        input_layout="full",
+        subset_manifest=manifest_path,
+        split="all",
+        camera="auto",
+        dataset_name_prefix="gigahands_real",
+        min_frames=17,
+        min_valid_ratio=0.9,
+        write_video=True,
+        clean_output=True,
+    )
+
+    assert not orphan_annotation.exists()
+    assert not orphan_video.exists()
 
 
 def test_real_gigahands_dataset_registration_is_present():
@@ -392,6 +459,12 @@ def test_pipeline_scripts_are_portable_and_expose_repo_stages():
         assert "/home/chonghej" not in payload
     assert "verify_videos)" in gigahands_script
     assert "make_unique_video_list)" in gigahands_script
+    assert "convert_undistorted)" in gigahands_script
+    assert "stats_undistorted)" in gigahands_script
+    assert "clean_generated)" in gigahands_script
+    assert "train_undistorted)" in gigahands_script
+    assert "eval_undistorted)" in gigahands_script
+    assert "NCCL_P2P_DISABLE" in gigahands_script
     assert "download_first_available" in opentouch_script
     assert "verify_raw)" in opentouch_script
     assert "eval_before)" in opentouch_script
@@ -408,6 +481,7 @@ def test_evaluator_dataset_kwargs_preserve_configured_action_representation():
             "clip_len": None,
             "state_mask_prob": 0.0,
             "target_image_height": 224,
+            "statistics_dataset_name": "gigahands_real_train",
         }
     }
 
@@ -418,3 +492,27 @@ def test_evaluator_dataset_kwargs_preserve_configured_action_representation():
     assert kwargs["rel_mode"] == "step"
     assert kwargs["clip_len"] is None
     assert kwargs["state_mask_prob"] == 0.0
+    assert kwargs["statistics_dataset_name"] == "gigahands_real_train"
+
+
+def test_evaluator_prefers_episode_camera_metadata():
+    module = load_module(EVAL_PATH, "evaluate_gigahands_stage1")
+    epi = {
+        "intrinsics": np.eye(3, dtype=np.float32),
+        "camera": {
+            "name": "cam0",
+            "image_size": [1280, 720],
+            "intrinsics": (np.eye(3, dtype=np.float32) * 2).tolist(),
+            "original_intrinsics": np.eye(3, dtype=np.float32).tolist(),
+            "distortion": [0.1, 0.01, 0.0, 0.0],
+            "undistorted": True,
+        },
+    }
+    context = {"episode": epi}
+
+    info = module.camera_info_for_context(None, context)
+
+    assert info["name"] == "cam0"
+    assert info["image_size"] == (1280, 720)
+    assert info["undistorted"] is True
+    np.testing.assert_allclose(info["intrinsics"], np.eye(3, dtype=np.float32) * 2)

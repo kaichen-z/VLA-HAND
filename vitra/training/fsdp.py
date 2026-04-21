@@ -515,12 +515,13 @@ class VLAFSDPStrategy(TrainingStrategy):
                     loss = prediction["loss"]
 
                     # Commit loss and backward
+                    zero_metric = loss.detach() * 0
                     metrics.commit(
-                        loss=loss, 
-                        left_hand_6d=prediction["left_hand_6d"],
-                        left_hand_joints=prediction["left_hand_joints"],
-                        right_hand_6d=prediction["right_hand_6d"],
-                        right_hand_joints=prediction["right_hand_joints"],
+                        loss=loss,
+                        left_hand_6d=prediction.get("left_hand_6d", prediction.get("left_6d", zero_metric)),
+                        left_hand_joints=prediction.get("left_hand_joints", prediction.get("left_joints", zero_metric)),
+                        right_hand_6d=prediction.get("right_hand_6d", prediction.get("right_6d", zero_metric)),
+                        right_hand_joints=prediction.get("right_hand_joints", prediction.get("right_joints", zero_metric)),
                     )
                     
                     normalized_loss = loss / self.grad_accumulation_steps

@@ -1,0 +1,73 @@
+{
+    "vla_name": "VITRA_Paligemma",
+    "task_name": "gigahands_real_large_keypoints_vitra3b_undistorted_stage1",
+    "model": "vitra_paligemma2",
+    "fwd_pred_next_n": 16,
+    "seed": 42,
+    "batch_size": 1,
+    "output_root": "runs/gigahands_real_large_keypoints_vitra3b_undistorted_train/checkpoints",
+    "log_root": "runs/gigahands_real_large_keypoints_vitra3b_undistorted_train/logs",
+    "cache_root": "runs/gigahands_real_large_keypoints_vitra3b_undistorted_train/cache",
+    "model_load_path": null,
+    "pretrain_path": "./checkpoints/vitra-vla-3b.pt",
+    "resume": false,
+    "wandb_project": "vitra-gigahands-real-keypoints",
+    "wandb_entity": "",
+    "save_steps": 20000,
+    "epoch_save_interval": 100000,
+    "total_batch_size": 2,
+    "use_bf16": true,
+    "use_fov": true,
+    "untied_cognition_token": true,
+    "use_state": "DiT",
+    "loss_type": "human",
+    "train_setup": {
+        "freeze_option": "freeze_vision_encoder"
+    },
+    "state_encoder": {
+        "state_dim": 212
+    },
+    "action_model": {
+        "model_type": "DiT-B",
+        "token_size": 2304,
+        "action_dim": 192,
+        "hidden_size": 1024
+    },
+    "vlm": {
+        "type": "PaliGemmaForConditionalGeneration",
+        "name": "paligemma",
+        "pretrained_model_name_or_path": "google/paligemma2-3b-mix-224"
+    },
+    "trainer": {
+        "sharding_strategy": "shard-grad-op",
+        "strategy": "fsdp_paligemma_with_checkpointing",
+        "lr_scheduler_type": "backbone-freeze-warmup",
+        "gradient_clip_val": 1.0,
+        "learning_rate": 1e-05,
+        "weight_decay": 0.1,
+        "max_epochs": 100000,
+        "max_steps": 65000,
+        "reduce_in_full_precision": true,
+        "enable_mixed_precision_training": false,
+        "enable_gradient_checkpointing": true,
+        "action_model_learning_rate": 0.0001,
+        "llm_freeze_step": 5000,
+        "warmup_ratio": null
+    },
+    "train_dataset": {
+        "data_root_dir": "datasets/vitra_gigahands_real_large_keypoints_undistorted",
+        "augmentation": false,
+        "set_none_ratio": 0.0,
+        "data_mix": "gigahands_real_train",
+        "num_workers": 2,
+        "prefetch_factor": null,
+        "flip_augmentation": 1.0,
+        "action_type": "keypoints",
+        "use_rel": false,
+        "clip_len": null,
+        "normalization": true,
+        "state_mask_prob": 0.0,
+        "statistics_dataset_name": "gigahands_real_train"
+    },
+    "repeated_diffusion_steps": 8
+}

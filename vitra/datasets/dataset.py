@@ -28,7 +28,8 @@ class FrameDataset(Dataset):
     def __init__(self, dataset_folder, dataset_name,
                  image_past_window_size=0, image_future_window_size=0, action_past_window_size=0, action_future_window_size=0,
                  augmentation=False, normalization=True, processor=None, flip_augmentation=1.0, set_none_ratio=0.0,
-                 action_type="angle", use_rel=False, rel_mode='step', load_images=True, data_type='human', clip_len=None, state_mask_prob=0.1, target_image_height=224):
+                 action_type="angle", use_rel=False, rel_mode='step', load_images=True, data_type='human', clip_len=None, state_mask_prob=0.1, target_image_height=224,
+                 statistics_dataset_name: Optional[str] = None):
         # only support image_past_window_size=0 now (in the post transform)
         """Both past and future window size does not include the current frame"""
         self.image_past_window_size = image_past_window_size
@@ -47,45 +48,46 @@ class FrameDataset(Dataset):
         self.rel_mode = rel_mode # 'step'
         training_path = None
         assert action_type in {"angle", "keypoints"} and use_rel == False and rel_mode == 'step', "Please recalculate the statistics and update the path here with other action representations."
+        stats_name = statistics_dataset_name or dataset_name
         if dataset_name == 'ego4d_cooking_and_cleaning':
             annotation_file = os.path.join(dataset_folder, "Annotation/ego4d_cooking_and_cleaning/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, "Annotation/ego4d_cooking_and_cleaning/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, "Annotation/statistics/ego4d_cooking_and_cleaning_angle_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_angle_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/Ego4D_root')
         elif dataset_name == 'egoexo4d':
             annotation_file = os.path.join(dataset_folder, "Annotation/egoexo4d/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, "Annotation/egoexo4d/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, "Annotation/statistics/egoexo4d_angle_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_angle_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/EgoExo4D_root')
         elif dataset_name == 'epic':
             annotation_file = os.path.join(dataset_folder, "Annotation/epic/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, "Annotation/epic/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, "Annotation/statistics/epic_angle_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_angle_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/Epic-Kitchen_root')
         elif dataset_name == 'ssv2':
             annotation_file = os.path.join(dataset_folder, "Annotation/ssv2/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, "Annotation/ssv2/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, "Annotation/statistics/ssv2_angle_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_angle_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/Somethingsomething-v2_root')
         elif dataset_name == 'ego4d_other':
             annotation_file = os.path.join(dataset_folder, "Annotation/ego4d_other/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, "Annotation/ego4d_other/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, "Annotation/statistics/ego4d_other_angle_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_angle_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/Ego4D_root')
         elif dataset_name == 'gigahands':
             annotation_file = os.path.join(dataset_folder, "Annotation/gigahands/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, "Annotation/gigahands/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, "Annotation/statistics/gigahands_angle_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_angle_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/GigaHands_root')
         elif dataset_name.startswith('gigahands_real_'):
             annotation_file = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{dataset_name}_angle_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_{action_type}_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/GigaHands_root')
         elif dataset_name.startswith('opentouch_keypoint_'):
             annotation_file = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episode_frame_index.npz")
             label_folder = os.path.join(dataset_folder, f"Annotation/{dataset_name}/episodic_annotations")
-            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{dataset_name}_{action_type}_statistics.json")
+            statistics_path = os.path.join(dataset_folder, f"Annotation/statistics/{stats_name}_{action_type}_statistics.json")
             video_root = os.path.join(dataset_folder, 'Video/OpenTouch_root')
         elif dataset_name == 'robo_dataset':
             root_dir = os.path.join(dataset_folder, "TeleData")
@@ -293,7 +295,8 @@ class MultipleWeightedDataset(Dataset):
     def load_datasets(cls, dataset_folder, data_mix,
                       image_past_window_size=0, image_future_window_size=0, action_past_window_size=0, action_future_window_size=0,
                       augmentation=False, normalization=True, processor = None, flip_augmentation=1.0, set_none_ratio=0.0,
-                      action_type="angle", use_rel=False, rel_mode='step', clip_len=None, state_mask_prob=0.1, target_image_height=224):
+                      action_type="angle", use_rel=False, rel_mode='step', clip_len=None, state_mask_prob=0.1, target_image_height=224,
+                      statistics_dataset_name: Optional[str] = None):
         dataset_weight_list = []
         if data_mix in HAND_MIXTURES:
             dataset_weight_list = HAND_MIXTURES[data_mix]
@@ -314,7 +317,8 @@ class MultipleWeightedDataset(Dataset):
                                    image_past_window_size, image_future_window_size, 
                                    action_past_window_size, action_future_window_size,
                                    augmentation, normalization, processor, flip_augmentation, set_none_ratio,
-                                   action_type, use_rel, rel_mode, load_images=True, data_type=data_type, clip_len=clip_len, state_mask_prob=state_mask_prob, target_image_height=target_image_height)
+                                   action_type, use_rel, rel_mode, load_images=True, data_type=data_type, clip_len=clip_len, state_mask_prob=state_mask_prob, target_image_height=target_image_height,
+                                   statistics_dataset_name=statistics_dataset_name)
             datasets.append(dataset)
             weights.append(weight)
         data_statistics = cls.weighted_average_statistics(datasets, weights)

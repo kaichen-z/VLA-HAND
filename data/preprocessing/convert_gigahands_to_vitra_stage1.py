@@ -52,6 +52,17 @@ class SourceEpisode:
     camera: str | None = None
 
 
+@dataclass(frozen=True)
+class VideoWritePlan:
+    source: Path
+    destination: Path
+    intrinsics_raw: np.ndarray
+    intrinsics_used: np.ndarray
+    distortion: np.ndarray
+    image_size: tuple[int, int]
+    undistort: bool
+
+
 def qvec2rotmat(qvec: np.ndarray) -> np.ndarray:
     return np.array(
         [
@@ -122,12 +133,20 @@ def load_json(path: Path) -> Any:
 
 
 def find_keypoints_path(sequence_root: Path, sequence_id: str) -> Path | None:
-    candidates = [
-        sequence_root / "keypoints_3d_mano" / f"{sequence_id}.json",
-        sequence_root / "keypoints_3d_mano" / sequence_id,
-        sequence_root / "keypoints_3d" / f"{sequence_id}.json",
-        sequence_root / "keypoints_3d" / sequence_id,
-    ]
+    aliases = [sequence_id]
+    if str(sequence_id).isdigit():
+        aliases.extend([str(int(sequence_id)), str(sequence_id).zfill(3)])
+    aliases = list(dict.fromkeys(aliases))
+    candidates = []
+    for alias in aliases:
+        candidates.extend(
+            [
+                sequence_root / "keypoints_3d_mano" / f"{alias}.json",
+                sequence_root / "keypoints_3d_mano" / alias,
+                sequence_root / "keypoints_3d" / f"{alias}.json",
+                sequence_root / "keypoints_3d" / alias,
+            ]
+        )
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -444,28 +463,60 @@ def choose_main_hand(left: dict[str, np.ndarray], right: dict[str, np.ndarray]) 
     return "left" if left_motion > right_motion else "right"
 
 
-def write_or_copy_video(
-    source: Path,
-    destination: Path,
-    intrinsics: np.ndarray,
-    dist: np.ndarray,
-    image_size: tuple[int, int],
-    undistort: bool,
-    write_video: bool,
-) -> tuple[np.ndarray, bool]:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if not write_video:
-        return intrinsics, False
-    if not undistort:
-        shutil.copy2(source, destination)
-        return intrinsics, False
-
+def undistorted_intrinsics(intrinsics: np.ndarray, dist: np.ndarray, image_size: tuple[int, int]) -> np.ndarray:
     try:
         import cv2
     except ImportError as exc:
         raise RuntimeError("--undistort requires opencv-python/cv2 to be installed") from exc
 
     new_intrinsics, _ = cv2.getOptimalNewCameraMatrix(intrinsics, dist, image_size, alpha=1)
+    return new_intrinsics.astype(np.float32)
+
+
+def metadata_path(path: Path, root: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(root.resolve()))
+    except ValueError:
+        return str(path)
+
+
+def build_camera_metadata(
+    *,
+    camera_name: str,
+    camera_path: Path,
+    source_video_path: Path,
+    intrinsics_raw: np.ndarray,
+    intrinsics_used: np.ndarray,
+    distortion: np.ndarray,
+    image_size: tuple[int, int],
+    undistorted: bool,
+    root: Path,
+) -> dict[str, Any]:
+    return {
+        "name": camera_name,
+        "image_size": [int(image_size[0]), int(image_size[1])],
+        "intrinsics": np.asarray(intrinsics_used, dtype=np.float32),
+        "original_intrinsics": np.asarray(intrinsics_raw, dtype=np.float32),
+        "distortion": np.asarray(distortion, dtype=np.float32),
+        "undistorted": bool(undistorted),
+        "camera_path": metadata_path(camera_path, root),
+        "source_video_path": metadata_path(source_video_path, root),
+    }
+
+
+def write_video_from_plan(plan: VideoWritePlan) -> bool:
+    source = plan.source
+    destination = plan.destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not plan.undistort:
+        shutil.copy2(source, destination)
+        return False
+
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("--undistort requires opencv-python/cv2 to be installed") from exc
+
     cap = cv2.VideoCapture(str(source))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video for undistortion: {source}")
@@ -479,14 +530,14 @@ def write_or_copy_video(
             ok, frame = cap.read()
             if not ok:
                 break
-            writer.write(cv2.undistort(frame, intrinsics, dist, None, new_intrinsics))
+            writer.write(cv2.undistort(frame, plan.intrinsics_raw, plan.distortion, None, plan.intrinsics_used))
     finally:
         cap.release()
         writer.release()
-    return new_intrinsics.astype(np.float32), True
+    return True
 
 
-def build_episode(source: SourceEpisode, output_root: Path, camera: str, write_video: bool, undistort: bool) -> tuple[str, dict[str, Any], bool]:
+def build_episode(source: SourceEpisode, output_root: Path, gigahands_root: Path, camera: str, write_video: bool, undistort: bool) -> tuple[str, dict[str, Any], VideoWritePlan | None]:
     params = load_hand_params(source.params_path)
     total_frames = min(len(params["left"]["poses"]), len(params["right"]["poses"]))
     start = max(source.start_frame, 0)
@@ -498,9 +549,19 @@ def build_episode(source: SourceEpisode, output_root: Path, camera: str, write_v
     intrinsics, extrinsic, image_size, dist = read_camera(source.camera_path, camera_name)
     rel_video_path = Path(source.sequence_name) / camera_name / source.video_path.name
     output_video_path = output_root / "Video" / "GigaHands_root" / rel_video_path
-    intrinsics, did_undistort = write_or_copy_video(
-        source.video_path, output_video_path, intrinsics, dist, image_size, undistort, write_video
-    )
+    should_undistort = bool(write_video and undistort)
+    intrinsics_used = undistorted_intrinsics(intrinsics, dist, image_size) if should_undistort else intrinsics
+    video_plan = None
+    if write_video:
+        video_plan = VideoWritePlan(
+            source=source.video_path,
+            destination=output_video_path,
+            intrinsics_raw=intrinsics.astype(np.float32),
+            intrinsics_used=intrinsics_used.astype(np.float32),
+            distortion=dist.astype(np.float32),
+            image_size=image_size,
+            undistort=should_undistort,
+        )
     extrinsics = np.repeat(extrinsic[None, ...], frame_count, axis=0).astype(np.float32)
 
     keypoints = load_keypoint_fallback(source.keypoints_path, total_frames)
@@ -515,11 +576,23 @@ def build_episode(source: SourceEpisode, output_root: Path, camera: str, write_v
         f"{safe_name(camera_name)}_{clip_name}_f{start:06d}_{end:06d}_ep_000000"
     )
     instruction = source.instruction
+    camera_metadata = build_camera_metadata(
+        camera_name=camera_name,
+        camera_path=source.camera_path,
+        source_video_path=source.video_path,
+        intrinsics_raw=intrinsics,
+        intrinsics_used=intrinsics_used,
+        distortion=dist,
+        image_size=image_size,
+        undistorted=should_undistort,
+        root=gigahands_root,
+    )
     episode = {
         "video_name": str(rel_video_path),
         "video_decode_frame": np.arange(start, end, dtype=np.int64),
-        "intrinsics": intrinsics.astype(np.float32),
+        "intrinsics": intrinsics_used.astype(np.float32),
         "extrinsics": extrinsics,
+        "camera": camera_metadata,
         "anno_type": choose_main_hand(left, right),
         "text": {
             "left": [(instruction, (0, frame_count))],
@@ -532,7 +605,7 @@ def build_episode(source: SourceEpisode, output_root: Path, camera: str, write_v
         "left": left,
         "right": right,
     }
-    return episode_id, episode, did_undistort
+    return episode_id, episode, video_plan
 
 
 def safe_name(value: str) -> str:
@@ -553,7 +626,11 @@ def init_report(camera: str, undistort: bool) -> dict[str, Any]:
         "used_mano_joints": 0,
         "used_keypoint_fallback_joints": 0,
         "camera": camera,
-        "undistorted": bool(undistort),
+        "undistorted": False,
+        "undistorted_requested": bool(undistort),
+        "undistorted_written": False,
+        "num_undistorted_videos": 0,
+        "num_raw_copied_videos": 0,
         "video_written": False,
         "errors": [],
     }
@@ -570,10 +647,14 @@ def convert_gigahands_to_vitra(
     min_frames: int = 17,
     min_valid_ratio: float = 0.9,
     write_video: bool = True,
-    undistort: bool = True,
+    undistort: bool = False,
+    clean_output: bool = False,
 ) -> dict[str, Any]:
     gigahands_root = Path(gigahands_root)
     output_root = Path(output_root)
+    if clean_output:
+        shutil.rmtree(output_root / "Annotation", ignore_errors=True)
+        shutil.rmtree(output_root / "Video" / "GigaHands_root", ignore_errors=True)
     if input_layout == "demo":
         demo_summary = summarize_demo_layout(gigahands_root, camera)
         sources = discover_demo_episodes(gigahands_root, camera)
@@ -611,7 +692,7 @@ def convert_gigahands_to_vitra(
             report["skipped_missing_camera"] += 1
             continue
         try:
-            episode_id, episode, did_undistort = build_episode(source, output_root, camera, write_video, undistort)
+            episode_id, episode, video_plan = build_episode(source, output_root, gigahands_root, camera, write_video, undistort)
         except ValueError as exc:
             if "Camera" in str(exc):
                 report["skipped_missing_camera"] += 1
@@ -638,18 +719,32 @@ def convert_gigahands_to_vitra(
         if episode_id in dataset_state["id_set"]:
             report["errors"].append({"source": str(source.params_path), "error": f"Duplicate episode_id: {episode_id}"})
             continue
+
+        if video_plan is not None:
+            try:
+                did_undistort = write_video_from_plan(video_plan)
+            except Exception as exc:
+                report["errors"].append({"source": str(source.video_path), "error": str(exc)})
+                continue
+            report["video_written"] = True
+            if did_undistort:
+                report["num_undistorted_videos"] += 1
+            else:
+                report["num_raw_copied_videos"] += 1
+            report["undistorted_written"] = report["undistorted_written"] or did_undistort
+
         dataset_state["id_set"].add(episode_id)
         dataset_state["ids"].append(episode_id)
         dataset_state["pairs"].extend((episode_index, frame_id) for frame_id in range(frame_count))
         np.save(label_root / f"{episode_id}.npy", episode, allow_pickle=True)
         report["num_episodes_written"] += 1
         report["num_frames_written"] += frame_count
-        report["video_written"] = report["video_written"] or bool(write_video)
-        report["undistorted"] = report["undistorted"] and did_undistort if undistort else False
         if source.keypoints_path is None:
             report["used_mano_joints"] += 1
         else:
             report["used_keypoint_fallback_joints"] += 1
+
+    report["undistorted"] = bool(report["num_undistorted_videos"] > 0 and report["num_raw_copied_videos"] == 0)
 
     for dataset_name, dataset_state in datasets.items():
         annotation_root = output_root / "Annotation" / dataset_name
@@ -685,6 +780,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_valid_ratio", type=float, default=0.9)
     parser.add_argument("--write_video", action="store_true")
     parser.add_argument("--undistort", action="store_true")
+    parser.add_argument("--clean_output", action="store_true")
     return parser.parse_args()
 
 
@@ -702,6 +798,7 @@ def main() -> None:
         min_valid_ratio=args.min_valid_ratio,
         write_video=args.write_video,
         undistort=args.undistort,
+        clean_output=args.clean_output,
     )
     print(json.dumps(report, indent=2))
 

@@ -10,6 +10,11 @@ from typing import Any
 
 import numpy as np
 
+try:
+    from vitra.datasets.video_utils import get_video_length
+except Exception:
+    get_video_length = None
+
 
 def clean_instruction(text: str) -> str:
     text = " ".join(str(text).replace("\n", " ").split()).strip()
@@ -40,6 +45,20 @@ def sequence_aliases(sequence: str) -> list[str]:
         aliases.append(str(int(sequence)))
         aliases.append(sequence.zfill(3))
     return list(dict.fromkeys(aliases))
+
+
+def keypoints_path_exists(sequence_root: Path, sequence_id: str) -> bool:
+    candidates = []
+    for alias in sequence_aliases(sequence_id):
+        candidates.extend(
+            [
+                sequence_root / "keypoints_3d_mano" / f"{alias}.json",
+                sequence_root / "keypoints_3d_mano" / alias,
+                sequence_root / "keypoints_3d" / f"{alias}.json",
+                sequence_root / "keypoints_3d" / alias,
+            ]
+        )
+    return any(path.exists() for path in candidates)
 
 
 def load_video_map(map_path: Path) -> dict[tuple[str, str], list[dict[str, str]]]:
@@ -101,6 +120,27 @@ def infer_video_path(root: Path, scene: str, sequence_id: str, camera: str, map_
     return video_root / f"{camera}_{sequence_id}.mp4"
 
 
+def infer_video_frame_count(video_path: Path) -> int:
+    if not video_path.exists():
+        return 0
+    if get_video_length is not None:
+        try:
+            return int(get_video_length(str(video_path)))
+        except Exception:
+            pass
+    try:
+        import cv2
+    except Exception:
+        return 0
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            return 0
+        return int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    finally:
+        cap.release()
+
+
 def hand_params_valid(params_path: Path, start: int, end: int, require_both_hands_valid: bool) -> tuple[bool, float]:
     if not params_path.exists():
         return False, 0.0
@@ -143,8 +183,10 @@ def build_candidates(
     min_frames: int,
     prefer_camera: str,
     require_both_hands_valid: bool,
+    require_keypoints: bool,
     prefer_bimanual_motion: bool,
     require_video_exists: bool,
+    require_video_frame_count: bool,
     target_candidates: int | None = None,
 ) -> list[dict[str, Any]]:
     annotations_path = gigahands_root / "annotations_v2.jsonl"
@@ -171,6 +213,9 @@ def build_candidates(
         start = max(int(row.get("start_frame_id", row.get("start_frame", 0)) or 0), 0)
         raw_end = int(row.get("end_frame_id", row.get("end_frame", -1)) or -1)
         params_path = gigahands_root / "hand_poses" / scene / "params" / f"{sequence_id}.json"
+        sequence_root = gigahands_root / "hand_poses" / scene
+        if require_keypoints and not keypoints_path_exists(sequence_root, sequence_id):
+            continue
         frame_count = infer_frame_count(params_path)
         end = min(raw_end + 1 if raw_end >= 0 else frame_count, frame_count)
         if end - start < min_frames:
@@ -185,6 +230,16 @@ def build_candidates(
         video_path = infer_video_path(gigahands_root, scene, sequence_id, camera, map_rows)
         if require_video_exists and not video_path.exists():
             continue
+        video_frame_count = infer_video_frame_count(video_path) if require_video_frame_count else 0
+        if require_video_frame_count:
+            if video_frame_count <= start:
+                continue
+            end = min(end, video_frame_count)
+            if end - start < min_frames:
+                continue
+            valid, bimanual_motion = hand_params_valid(params_path, start, end, require_both_hands_valid)
+            if not valid:
+                continue
         video_rel = (
             str(video_path.relative_to(gigahands_root))
             if not video_path.is_absolute() or video_path.is_relative_to(gigahands_root)
@@ -203,6 +258,7 @@ def build_candidates(
             "start_frame": start,
             "end_frame": end,
             "num_frames": end - start,
+            "video_num_frames": video_frame_count,
             "bimanual_motion": bimanual_motion,
             "params_path": str(params_path.relative_to(gigahands_root)),
             "camera_path": str((gigahands_root / "hand_poses" / scene / "optim_params.txt").relative_to(gigahands_root)),
@@ -231,6 +287,15 @@ def infer_frame_count(params_path: Path) -> int:
 
 
 def choose_camera(root: Path, scene: str, sequence_id: str, prefer_camera: str, map_rows: list[dict[str, str]]) -> str:
+    candidate_cameras = [prefer_camera]
+    for row in map_rows:
+        candidate_cameras.extend(key for key, value in row.items() if key.startswith("brics-odroid-") and value)
+    video_root = root / "multiview_rgb_vids" / scene
+    if video_root.exists():
+        candidate_cameras.extend(path.name for path in sorted(video_root.iterdir()) if path.is_dir())
+    for camera in list(dict.fromkeys(camera for camera in candidate_cameras if camera)):
+        if infer_video_path(root, scene, sequence_id, camera, map_rows).exists():
+            return camera
     for row in map_rows:
         if row.get(prefer_camera):
             return prefer_camera
@@ -262,8 +327,10 @@ def prepare_real_subset(
     min_frames: int,
     prefer_camera: str,
     require_both_hands_valid: bool,
+    require_keypoints: bool,
     prefer_bimanual_motion: bool,
     require_video_exists: bool,
+    require_video_frame_count: bool,
     output_manifest: str | Path,
     output_video_list: str | Path,
     candidate_pool_factor: int = 4,
@@ -277,8 +344,10 @@ def prepare_real_subset(
         min_frames=min_frames,
         prefer_camera=prefer_camera,
         require_both_hands_valid=require_both_hands_valid,
+        require_keypoints=require_keypoints,
         prefer_bimanual_motion=prefer_bimanual_motion,
         require_video_exists=require_video_exists,
+        require_video_frame_count=require_video_frame_count,
         target_candidates=max(num_train + num_test, (num_train + num_test) * candidate_pool_factor),
     )
     selected = candidates[: num_train + num_test]
@@ -305,8 +374,10 @@ def prepare_real_subset(
             "min_frames": min_frames,
             "prefer_camera": prefer_camera,
             "require_both_hands_valid": require_both_hands_valid,
+            "require_keypoints": require_keypoints,
             "prefer_bimanual_motion": prefer_bimanual_motion,
             "require_video_exists": require_video_exists,
+            "require_video_frame_count": require_video_frame_count,
             "candidate_pool_factor": candidate_pool_factor,
         },
         "splits": {
@@ -338,8 +409,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min_frames", type=int, default=32)
     parser.add_argument("--prefer_camera", default="brics-odroid-011_cam0")
     parser.add_argument("--require_both_hands_valid", action="store_true")
+    parser.add_argument("--require_keypoints", action="store_true")
     parser.add_argument("--prefer_bimanual_motion", action="store_true")
     parser.add_argument("--require_video_exists", action="store_true")
+    parser.add_argument("--require_video_frame_count", action="store_true")
     parser.add_argument("--candidate_pool_factor", type=int, default=4)
     parser.add_argument("--output_manifest", type=Path, required=True)
     parser.add_argument("--output_video_list", type=Path, required=True)
@@ -355,8 +428,10 @@ def main() -> None:
         min_frames=args.min_frames,
         prefer_camera=args.prefer_camera,
         require_both_hands_valid=args.require_both_hands_valid,
+        require_keypoints=args.require_keypoints,
         prefer_bimanual_motion=args.prefer_bimanual_motion,
         require_video_exists=args.require_video_exists,
+        require_video_frame_count=args.require_video_frame_count,
         output_manifest=args.output_manifest,
         output_video_list=args.output_video_list,
         candidate_pool_factor=args.candidate_pool_factor,

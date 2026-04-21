@@ -51,6 +51,28 @@ FINGER_LENGTHS = np.asarray(
     dtype=np.float32,
 )
 
+CAMERA_DTYPE = [
+    ("cam_id", int),
+    ("width", int),
+    ("height", int),
+    ("fx", float),
+    ("fy", float),
+    ("cx", float),
+    ("cy", float),
+    ("k1", float),
+    ("k2", float),
+    ("p1", float),
+    ("p2", float),
+    ("cam_name", "<U64"),
+    ("qvecw", float),
+    ("qvecx", float),
+    ("qvecy", float),
+    ("qvecz", float),
+    ("tvecx", float),
+    ("tvecy", float),
+    ("tvecz", float),
+]
+
 
 def compute_action_metrics(prediction: np.ndarray, target: np.ndarray, action_masks: np.ndarray) -> dict[str, float]:
     prediction = np.asarray(prediction, dtype=np.float32)
@@ -515,6 +537,13 @@ def project_vertices_to_image(vertices: np.ndarray, intrinsics: np.ndarray) -> t
     return np.stack([u, v], axis=-1).astype(np.int32), valid
 
 
+def project_points_to_image(points_3d: np.ndarray, intrinsics: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    points_3d = np.asarray(points_3d, dtype=np.float32)
+    flat = points_3d.reshape(-1, 3)
+    points, valid = project_vertices_to_image(flat, intrinsics)
+    return points.reshape(*points_3d.shape[:-1], 2), valid.reshape(points_3d.shape[:-1])
+
+
 def draw_projected_mesh(
     frame_rgb: np.ndarray,
     left_vertices: np.ndarray,
@@ -562,6 +591,41 @@ def draw_projected_mesh(
     return frame
 
 
+def draw_projected_keypoints(
+    frame_rgb: np.ndarray,
+    left_joints: np.ndarray,
+    right_joints: np.ndarray,
+    intrinsics: np.ndarray,
+    label: str,
+) -> np.ndarray:
+    import cv2
+
+    frame = np.asarray(frame_rgb).copy()
+    height, width = frame.shape[:2]
+    overlay = frame.copy()
+    side_specs = [
+        ("left", left_joints, (40, 220, 255)),
+        ("right", right_joints, (80, 255, 120)),
+    ]
+    for side, joints, color in side_specs:
+        points, valid = project_points_to_image(joints, intrinsics)
+        visible = valid & (points[:, 0] >= 0) & (points[:, 0] < width) & (points[:, 1] >= 0) & (points[:, 1] < height)
+        for chain in FINGER_CHAINS:
+            for a, b in zip(chain[:-1], chain[1:]):
+                if visible[a] and visible[b]:
+                    cv2.line(overlay, tuple(points[a]), tuple(points[b]), color, 2, cv2.LINE_AA)
+        for point, is_visible in zip(points, visible):
+            if is_visible:
+                cv2.circle(overlay, tuple(point), 4, color, -1, cv2.LINE_AA)
+        if np.any(visible):
+            center = points[visible].mean(axis=0).astype(np.int32)
+            cv2.putText(overlay, side, tuple(center + np.array([8, -8])), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
+    frame = cv2.addWeighted(overlay, 0.82, frame, 0.18, 0)
+    cv2.rectangle(frame, (12, 12), (340, 52), (0, 0, 0), -1)
+    cv2.putText(frame, label, (24, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (245, 245, 245), 2, cv2.LINE_AA)
+    return frame
+
+
 def read_video_frames_at(video_path: Path, frame_indices: np.ndarray, fallback_frame: np.ndarray) -> list[np.ndarray]:
     import cv2
 
@@ -580,6 +644,22 @@ def read_video_frames_at(video_path: Path, frame_indices: np.ndarray, fallback_f
     finally:
         cap.release()
     return frames
+
+
+def undistort_rgb_frames(frames_rgb: list[np.ndarray], intrinsics: np.ndarray, distortion: np.ndarray, image_size: tuple[int, int]) -> tuple[list[np.ndarray], np.ndarray]:
+    import cv2
+
+    new_intrinsics, _ = cv2.getOptimalNewCameraMatrix(
+        np.asarray(intrinsics, dtype=np.float32),
+        np.asarray(distortion, dtype=np.float32),
+        tuple(int(v) for v in image_size),
+        alpha=1,
+    )
+    undistorted = [
+        cv2.undistort(np.asarray(frame), np.asarray(intrinsics, dtype=np.float32), np.asarray(distortion, dtype=np.float32), None, new_intrinsics)
+        for frame in frames_rgb
+    ]
+    return undistorted, new_intrinsics.astype(np.float32)
 
 
 def resize_rgb(frame: np.ndarray, size: tuple[int, int]) -> np.ndarray:
@@ -700,6 +780,40 @@ def write_rgb_overlay_grid_video(
             grid = np.vstack([np.hstack(panels[:2]), np.hstack(panels[2:4])])
             draw_wrapped_text(grid, instruction, (18, 690), max_width=1220, color=(245, 245, 245), scale=0.55)
             writer.write(cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    transcode_h264_in_place(output_path)
+    return output_path.exists()
+
+
+def write_keypoint_overlay_video(
+    frames_rgb: list[np.ndarray],
+    left_joints: np.ndarray,
+    right_joints: np.ndarray,
+    intrinsics: np.ndarray,
+    output_path: Path,
+    label: str = "GT keypoints",
+    fps: float = 8.0,
+) -> bool:
+    try:
+        import cv2
+    except ImportError:
+        return False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = frames_rgb[0].shape[:2]
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
+    num_frames = min(len(frames_rgb), len(left_joints), len(right_joints))
+    try:
+        for frame_idx in range(num_frames):
+            overlay = draw_projected_keypoints(
+                frames_rgb[frame_idx],
+                np.asarray(left_joints[frame_idx], dtype=np.float32),
+                np.asarray(right_joints[frame_idx], dtype=np.float32),
+                intrinsics,
+                label=label,
+            )
+            writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     finally:
         writer.release()
     transcode_h264_in_place(output_path)
@@ -1295,8 +1409,132 @@ def sample_video_context(dataset, idx: int, num_frames: int) -> dict[str, Any]:
     return {
         "episode_id": episode_id,
         "frame_id": int(frame_id),
+        "local_frame_ids": local_frame_ids,
         "video_path": video_path,
         "video_frame_ids": video_frame_ids,
+        "episode": epi,
+    }
+
+
+def dataset_root_from_dataset(dataset) -> Path:
+    video_root = Path(dataset.episodic_dataset_core.video_root)
+    if video_root.name == "GigaHands_root" and video_root.parent.name == "Video":
+        return video_root.parent.parent
+    return video_root.parent
+
+
+def read_camera_row(camera_path: Path, camera_name: str) -> dict[str, Any]:
+    params = np.loadtxt(camera_path, dtype=CAMERA_DTYPE)
+    params = np.atleast_1d(params)
+    if camera_name == "auto":
+        row = params[0]
+    else:
+        matches = [row for row in params if str(row["cam_name"]) == camera_name]
+        if not matches:
+            raise ValueError(f"Camera '{camera_name}' not found in {camera_path}")
+        row = matches[0]
+    intrinsics = np.eye(3, dtype=np.float32)
+    intrinsics[0, 0] = row["fx"]
+    intrinsics[1, 1] = row["fy"]
+    intrinsics[0, 2] = row["cx"]
+    intrinsics[1, 2] = row["cy"]
+    return {
+        "name": str(row["cam_name"]),
+        "image_size": (int(row["width"]), int(row["height"])),
+        "intrinsics": intrinsics,
+        "original_intrinsics": intrinsics.copy(),
+        "distortion": np.asarray([row["k1"], row["k2"], row["p1"], row["p2"]], dtype=np.float32),
+        "undistorted": False,
+    }
+
+
+def load_subset_manifest(dataset_root: Path) -> dict[str, Any] | None:
+    manifest_path = dataset_root / "subset_manifest.json"
+    if not manifest_path.exists():
+        return None
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def resolve_manifest_path(root: Path, value: Any) -> Path:
+    path = Path(str(value))
+    return path if path.is_absolute() else root / path
+
+
+def fallback_camera_from_manifest(dataset_root: Path, epi: dict[str, Any]) -> dict[str, Any] | None:
+    manifest = load_subset_manifest(dataset_root)
+    if not manifest:
+        return None
+    source_root = Path(str(manifest.get("source_root", dataset_root)))
+    if not source_root.is_absolute():
+        source_root = dataset_root / source_root
+    video_name = str(epi.get("video_name", ""))
+    for clip in manifest.get("clips", []):
+        clip_video = str(clip.get("video_path", ""))
+        if clip_video.endswith(video_name):
+            camera_path = resolve_manifest_path(source_root, clip.get("camera_path"))
+            camera_name = str(clip.get("camera", "auto"))
+            try:
+                return read_camera_row(camera_path, camera_name)
+            except Exception as exc:
+                print(f"Warning: failed to load camera metadata from {camera_path}: {exc}")
+                return None
+    return None
+
+
+def camera_info_for_context(dataset, context: dict[str, Any]) -> dict[str, Any] | None:
+    epi = context["episode"]
+    camera = epi.get("camera")
+    if isinstance(camera, dict):
+        return {
+            "name": str(camera.get("name", "")),
+            "image_size": tuple(int(v) for v in camera.get("image_size", [0, 0])),
+            "intrinsics": np.asarray(camera.get("intrinsics", epi["intrinsics"]), dtype=np.float32),
+            "original_intrinsics": np.asarray(camera.get("original_intrinsics", epi["intrinsics"]), dtype=np.float32),
+            "distortion": np.asarray(camera.get("distortion", np.zeros(4, dtype=np.float32)), dtype=np.float32),
+            "undistorted": bool(camera.get("undistorted", False)),
+        }
+    if dataset is None:
+        return None
+    return fallback_camera_from_manifest(dataset_root_from_dataset(dataset), epi)
+
+
+def prepare_overlay_frames(
+    frames_rgb: list[np.ndarray],
+    dataset,
+    context: dict[str, Any],
+    fallback_intrinsics: np.ndarray,
+    undistort_overlay_frames: bool,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    epi = context["episode"]
+    camera_info = camera_info_for_context(dataset, context)
+    if camera_info is None:
+        if undistort_overlay_frames:
+            print(f"Warning: no camera metadata for {context['episode_id']}; using episode intrinsics without undistortion.")
+        return frames_rgb, np.asarray(epi.get("intrinsics", fallback_intrinsics), dtype=np.float32)
+
+    if camera_info["undistorted"]:
+        return frames_rgb, np.asarray(camera_info["intrinsics"], dtype=np.float32)
+
+    if undistort_overlay_frames:
+        return undistort_rgb_frames(
+            frames_rgb,
+            np.asarray(camera_info["original_intrinsics"], dtype=np.float32),
+            np.asarray(camera_info["distortion"], dtype=np.float32),
+            tuple(camera_info["image_size"]),
+        )
+
+    print(f"Warning: RGB overlay for {context['episode_id']} uses raw distorted frames with pinhole projection. Pass --undistort_overlay_frames for geometric overlay.")
+    return frames_rgb, np.asarray(epi.get("intrinsics", fallback_intrinsics), dtype=np.float32)
+
+
+def episode_side_labels(epi: dict[str, Any], side: str, local_frame_ids: np.ndarray) -> dict[str, np.ndarray]:
+    hand = epi[side]
+    return {
+        "transl_worldspace": np.asarray(hand["transl_camspace"], dtype=np.float32)[local_frame_ids],
+        "global_orient_worldspace": np.asarray(hand["global_orient_camspace"], dtype=np.float32)[local_frame_ids],
+        "hand_pose": np.asarray(hand["hand_pose"], dtype=np.float32)[local_frame_ids],
+        "beta": np.asarray(hand["beta"], dtype=np.float32),
     }
 
 
@@ -1351,6 +1589,9 @@ def write_rgb_overlay_videos(
     primary_label: str,
     dataset,
     mano_model_path: Path,
+    undistort_overlay_frames: bool = False,
+    keypoint_overlay_debug: bool = False,
+    mano_param_overlay_debug: bool = False,
 ) -> None:
     mano, faces, device = load_mano_model(mano_model_path)
     overlay_dir = output_dir / "rgb_overlay_videos"
@@ -1361,7 +1602,13 @@ def write_rgb_overlay_videos(
         num_frames = min(arr.shape[0] for sides in mesh_sets.values() for arr in sides.values())
         context = sample_video_context(dataset, primary["data_ids"][idx], num_frames)
         frames = read_video_frames_at(context["video_path"], context["video_frame_ids"], sample["image"])
-        intrinsics = sample["intrinsics"]
+        frames, intrinsics = prepare_overlay_frames(
+            frames,
+            dataset,
+            context,
+            fallback_intrinsics=sample["intrinsics"],
+            undistort_overlay_frames=undistort_overlay_frames,
+        )
 
         write_rgb_overlay_grid_video(
             frames_rgb=frames,
@@ -1380,6 +1627,43 @@ def write_rgb_overlay_videos(
                 intrinsics=intrinsics,
                 output_path=overlay_dir / f"clip_{idx:04d}_{label}_rgb_overlay.mp4",
                 label=label,
+            )
+        if keypoint_overlay_debug:
+            epi = context["episode"]
+            local_frame_ids = context["local_frame_ids"]
+            write_keypoint_overlay_video(
+                frames_rgb=frames,
+                left_joints=np.asarray(epi["left"]["joints_camspace"], dtype=np.float32)[local_frame_ids],
+                right_joints=np.asarray(epi["right"]["joints_camspace"], dtype=np.float32)[local_frame_ids],
+                intrinsics=intrinsics,
+                output_path=overlay_dir / f"clip_{idx:04d}_gt_keypoints_rgb_overlay.mp4",
+            )
+        if mano_param_overlay_debug:
+            epi = context["episode"]
+            local_frame_ids = context["local_frame_ids"]
+            param_mesh_sets = {
+                "mano_params": {
+                    "left": mano_vertices_from_labels(
+                        mano,
+                        episode_side_labels(epi, "left", local_frame_ids),
+                        is_left=True,
+                        device=device,
+                    ),
+                    "right": mano_vertices_from_labels(
+                        mano,
+                        episode_side_labels(epi, "right", local_frame_ids),
+                        is_left=False,
+                        device=device,
+                    ),
+                }
+            }
+            write_rgb_overlay_video(
+                frames_rgb=frames,
+                mesh_sets=param_mesh_sets,
+                faces=faces,
+                intrinsics=intrinsics,
+                output_path=overlay_dir / f"clip_{idx:04d}_mano_params_rgb_overlay.mp4",
+                label="mano_params",
             )
 
 
@@ -1429,6 +1713,9 @@ def run_model_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 args.label,
                 dataset,
                 args.mano_model_path,
+                undistort_overlay_frames=args.undistort_overlay_frames,
+                keypoint_overlay_debug=args.keypoint_overlay_debug,
+                mano_param_overlay_debug=args.mano_param_overlay_debug,
             )
         return comparison
 
@@ -1442,7 +1729,16 @@ def run_model_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     if args.mano_motion_videos:
         write_mano_motion_videos(output_dir, {args.label: result}, args.label, args.mano_model_path)
     if args.rgb_overlay_videos:
-        write_rgb_overlay_videos(output_dir, {args.label: result}, args.label, dataset, args.mano_model_path)
+        write_rgb_overlay_videos(
+            output_dir,
+            {args.label: result},
+            args.label,
+            dataset,
+            args.mano_model_path,
+            undistort_overlay_frames=args.undistort_overlay_frames,
+            keypoint_overlay_debug=args.keypoint_overlay_debug,
+            mano_param_overlay_debug=args.mano_param_overlay_debug,
+        )
     return metrics
 
 
@@ -1463,6 +1759,7 @@ def dataset_kwargs_from_config(config: dict[str, Any]) -> dict[str, Any]:
         "clip_len": train_dataset.get("clip_len", None),
         "state_mask_prob": train_dataset.get("state_mask_prob", 0.0),
         "target_image_height": train_dataset.get("target_image_height", 224),
+        "statistics_dataset_name": train_dataset.get("statistics_dataset_name", None),
     }
 
 
@@ -1489,6 +1786,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand_motion_videos", action="store_true")
     parser.add_argument("--mano_motion_videos", action="store_true")
     parser.add_argument("--rgb_overlay_videos", action="store_true")
+    parser.add_argument("--undistort_overlay_frames", action="store_true")
+    parser.add_argument("--keypoint_overlay_debug", action="store_true")
+    parser.add_argument("--mano_param_overlay_debug", action="store_true")
     parser.add_argument("--mano_model_path", type=Path, default=Path("weights/mano"))
     return parser.parse_args()
 

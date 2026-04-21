@@ -187,6 +187,7 @@ def experiment(variant):
         clip_len=variant["train_dataset"].get('clip_len', None),
         state_mask_prob=variant["train_dataset"].get('state_mask_prob', 0.1),
         target_image_height=variant["train_dataset"].get('target_image_height', 224),
+        statistics_dataset_name=variant["train_dataset"].get("statistics_dataset_name", None),
     )
     
     # === Training Strategy Setup ===
@@ -447,6 +448,12 @@ def parse_args():
         default=None,
         type=str,
         help="Path to checkpoint for resuming training"
+    )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        action="store_true",
+        help="Resume training from --model_load_path or the latest checkpoint in the run directory"
     )
     parser.add_argument(
         "--task_name",

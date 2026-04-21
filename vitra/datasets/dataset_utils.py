@@ -88,16 +88,23 @@ class ActionFeature(object):
                 'right_hand_joints': (*cls.HUMAN_RIGHT_JOINTS, 1.0),
             }
         elif action_type == 'keypoints':
-            # For keypoints type, joints have different dimensions (21*3=63)
-            left_joints_start = cls.HUMAN_LEFT_6D[1]  # After 6D
-            left_joints_end = left_joints_start + 63    # 21 joints * 3D
-            right_joints_start = cls.HUMAN_RIGHT_6D[1]
-            right_joints_end = right_joints_start + 63
-            
+            # Keypoint actions are packed as:
+            # left  = 6D wrist motion + 21x3 joints
+            # right = 6D wrist motion + 21x3 joints
+            hand_dim = 6 + 21 * 3
+            left_6d_start = 0
+            left_6d_end = 6
+            left_joints_start = left_6d_end
+            left_joints_end = hand_dim
+            right_6d_start = hand_dim
+            right_6d_end = right_6d_start + 6
+            right_joints_start = right_6d_end
+            right_joints_end = 2 * hand_dim
+
             return {
-                'left_6d': (*cls.HUMAN_LEFT_6D, 1.0),
+                'left_6d': (left_6d_start, left_6d_end, 1.0),
                 'left_joints': (left_joints_start, left_joints_end, 1.0),
-                'right_6d': (*cls.HUMAN_RIGHT_6D, 1.0),
+                'right_6d': (right_6d_start, right_6d_end, 1.0),
                 'right_joints': (right_joints_start, right_joints_end, 1.0),
             }
         else:

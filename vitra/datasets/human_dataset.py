@@ -393,15 +393,20 @@ class EpisodicDatasetCore(object):
 
         # ---------- read images --------------------
         # Retry mechanism: try up to 3 times to load video frames
+        last_error = None
         for attempt in range(3):
             try:
                 imgs, _ = load_video_decord(video_path, frame_index=decode_ids, rotation=False)
                 break  # Success, exit the retry loop
             except Exception as e:
-                # if attempt == 2:
-                #     raise  # Raise the exception after 3 failed attempts
+                last_error = e
                 print(f"Warning: failed to load video frames from {video_path} (attempt {attempt+1}/3): {e}")
                 time.sleep(0.1)
+        else:
+            raise RuntimeError(
+                f"Failed to load video frames from {video_path} after 3 attempts. "
+                f"decode_ids={list(np.asarray(decode_ids).astype(int))}"
+            ) from last_error
 
         images = np.stack(imgs, axis=0)           # (L,H,W,3) uint8
         mask   = ~oob                             # (L,) bool
@@ -805,22 +810,29 @@ class EpisodicDatasetCore(object):
         return sample_dict
 
     def __getitem__(self, idx):
-        if self.training_idx is not None:
-            data_id = self.training_idx[idx]
-        else:
-            data_id = idx
-        corr = self.index_frame_pair[data_id]
-        episode_id = self.index_to_episode_id[corr[0]]
-        sample = self.get_item_frame(
-            episode_id, int(corr[1]),
-            action_past_window_size=self.action_past_window_size,
-            action_future_window_size=self.action_future_window_size,
-            image_past_window_size=self.image_past_window_size,
-            image_future_window_size=self.image_future_window_size,
-            rel_mode=self.rel_mode,  # 'step'
-            load_images=self.load_images
-        )
-        return sample
+        last_error = None
+        for attempt in range(10):
+            try:
+                sample_idx = idx if attempt == 0 else random.randrange(len(self))
+                if self.training_idx is not None:
+                    data_id = self.training_idx[sample_idx]
+                else:
+                    data_id = sample_idx
+                corr = self.index_frame_pair[data_id]
+                episode_id = self.index_to_episode_id[corr[0]]
+                return self.get_item_frame(
+                    episode_id, int(corr[1]),
+                    action_past_window_size=self.action_past_window_size,
+                    action_future_window_size=self.action_future_window_size,
+                    image_past_window_size=self.image_past_window_size,
+                    image_future_window_size=self.image_future_window_size,
+                    rel_mode=self.rel_mode,  # 'step'
+                    load_images=self.load_images
+                )
+            except Exception as exc:
+                last_error = exc
+                print(f"Warning: failed to load sample idx={idx} (attempt {attempt + 1}/10): {exc}")
+        raise RuntimeError(f"Failed to load a valid sample after 10 attempts, original idx={idx}") from last_error
 
 def pad_state_human(
     state: torch.Tensor,
