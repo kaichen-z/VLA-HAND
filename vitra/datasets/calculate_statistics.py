@@ -20,6 +20,36 @@ def mean_std_or_default(values, fallback_dim, mean_default=0.0, std_default=1.0)
     return np.mean(arr, axis=0), np.std(arr, axis=0)
 
 
+def new_stats_accumulator(dim):
+    return {
+        'sum': np.zeros(dim, dtype=np.float64),
+        'sumsq': np.zeros(dim, dtype=np.float64),
+        'count': 0,
+    }
+
+
+def update_stats_accumulator(accumulator, values):
+    if values.size == 0:
+        return
+    values = values.astype(np.float64, copy=False)
+    accumulator['sum'] += values.sum(axis=0)
+    accumulator['sumsq'] += np.square(values).sum(axis=0)
+    accumulator['count'] += values.shape[0]
+
+
+def finalize_stats_accumulator(accumulator, mean_default=0.0, std_default=1.0):
+    dim = accumulator['sum'].shape[0]
+    if accumulator['count'] == 0:
+        return (
+            np.full(dim, mean_default, dtype=np.float32),
+            np.full(dim, std_default, dtype=np.float32),
+        )
+    mean = accumulator['sum'] / accumulator['count']
+    variance = accumulator['sumsq'] / accumulator['count'] - np.square(mean)
+    std = np.sqrt(np.maximum(variance, 0.0))
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
 def compute_statistics(dataset, num_workers=16, batch_size=128, save_folder='./'):
     """
     Compute mean and standard deviation of the 'state' in the dataset using multi-threading.
@@ -35,11 +65,10 @@ def compute_statistics(dataset, num_workers=16, batch_size=128, save_folder='./'
     """
     dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
     train_num = 0
-
-    state_left_list = []
-    state_right_list = []
-    action_left_list = []
-    action_right_list = []
+    state_left_acc = None
+    state_right_acc = None
+    action_left_acc = None
+    action_right_acc = None
     for batch in tqdm(dataloader, desc="Processing dataset"):
         current_state = batch['current_state'].numpy()
         current_state_mask = batch['current_state_mask'].numpy()
@@ -47,19 +76,25 @@ def compute_statistics(dataset, num_workers=16, batch_size=128, save_folder='./'
         action_mask = batch['action_mask'].numpy()
         dim = action_list.shape[-1] // 2
         half_state_dim = current_state.shape[-1] // 2
-        action_left_list.extend(action_list[action_mask[:, :, 0], :dim].tolist())
-        action_right_list.extend(action_list[action_mask[:, :, 1], dim:].tolist())
-        state_left_list.extend(current_state[current_state_mask[:, 0], :half_state_dim].tolist())
-        state_right_list.extend(current_state[current_state_mask[:, 1], half_state_dim:].tolist())
+        if action_left_acc is None:
+            action_left_acc = new_stats_accumulator(dim)
+            action_right_acc = new_stats_accumulator(dim)
+            state_left_acc = new_stats_accumulator(half_state_dim)
+            state_right_acc = new_stats_accumulator(half_state_dim)
+
+        update_stats_accumulator(action_left_acc, action_list[action_mask[:, :, 0], :dim])
+        update_stats_accumulator(action_right_acc, action_list[action_mask[:, :, 1], dim:])
+        update_stats_accumulator(state_left_acc, current_state[current_state_mask[:, 0], :half_state_dim])
+        update_stats_accumulator(state_right_acc, current_state[current_state_mask[:, 1], half_state_dim:])
         train_num += batch['current_state'].shape[0]
     
     del dataloader
-    action_dim = len(action_right_list[0]) if action_right_list else len(action_left_list[0])
-    state_dim = len(state_right_list[0]) if state_right_list else len(state_left_list[0])
-    action_left_mean, action_left_std = mean_std_or_default(action_left_list, action_dim)
-    state_left_mean, state_left_std = mean_std_or_default(state_left_list, state_dim)
-    action_right_mean, action_right_std = mean_std_or_default(action_right_list, action_dim)
-    state_right_mean, state_right_std = mean_std_or_default(state_right_list, state_dim)
+    if action_left_acc is None:
+        raise ValueError(f"Dataset '{dataset.dataset_name}' is empty; cannot calculate statistics.")
+    action_left_mean, action_left_std = finalize_stats_accumulator(action_left_acc)
+    state_left_mean, state_left_std = finalize_stats_accumulator(state_left_acc)
+    action_right_mean, action_right_std = finalize_stats_accumulator(action_right_acc)
+    state_right_mean, state_right_std = finalize_stats_accumulator(state_right_acc)
 
     my_dict = {
         'dataset_name': f"{dataset.dataset_name}_{dataset.action_type}_statistics.json",

@@ -1538,18 +1538,49 @@ def episode_side_labels(epi: dict[str, Any], side: str, local_frame_ids: np.ndar
     }
 
 
+def episode_has_mano_params(epi: dict[str, Any], side: str) -> bool:
+    hand = epi.get(side, {})
+    return all(key in hand for key in ("transl_camspace", "global_orient_camspace", "hand_pose", "beta"))
+
+
+def raw_mano_mesh_set_for_context(context: dict[str, Any], mano: Any, device: str) -> dict[str, np.ndarray] | None:
+    epi = context.get("episode")
+    local_frame_ids = context.get("local_frame_ids")
+    if epi is None or local_frame_ids is None:
+        return None
+    if not episode_has_mano_params(epi, "left") or not episode_has_mano_params(epi, "right"):
+        return None
+    return {
+        "left": mano_vertices_from_labels(
+            mano,
+            episode_side_labels(epi, "left", local_frame_ids),
+            is_left=True,
+            device=device,
+        ),
+        "right": mano_vertices_from_labels(
+            mano,
+            episode_side_labels(epi, "right", local_frame_ids),
+            is_left=False,
+            device=device,
+        ),
+    }
+
+
 def build_mano_mesh_sets(
     result_by_label: dict[str, dict[str, Any]],
     primary_label: str,
     idx: int,
     mano: Any,
     device: str,
+    context: dict[str, Any] | None = None,
+    gt_source: str = "raw_mano",
 ) -> dict[str, dict[str, np.ndarray]]:
     primary = result_by_label[primary_label]
     (state_left, beta_left), (state_right, beta_right) = split_state_beta_122(primary["states"][idx])
     target = primary["unnormalized_targets"][idx]
+    raw_gt_meshes = raw_mano_mesh_set_for_context(context or {}, mano, device) if gt_source == "raw_mano" else None
     mesh_sets: dict[str, dict[str, np.ndarray]] = {
-        "gt": {
+        "gt": raw_gt_meshes if raw_gt_meshes is not None else {
             "left": mano_vertices_from_labels(
                 mano,
                 traj_to_mano_labels(recon_traj_from_actions(state_left, target[:, :51]), beta_left),
@@ -1589,6 +1620,7 @@ def write_rgb_overlay_videos(
     primary_label: str,
     dataset,
     mano_model_path: Path,
+    gt_source: str = "raw_mano",
     undistort_overlay_frames: bool = False,
     keypoint_overlay_debug: bool = False,
     mano_param_overlay_debug: bool = False,
@@ -1598,7 +1630,16 @@ def write_rgb_overlay_videos(
     primary = result_by_label[primary_label]
     labels = ["gt", *result_by_label.keys()]
     for idx, sample in enumerate(primary["samples"]):
-        mesh_sets = build_mano_mesh_sets(result_by_label, primary_label, idx, mano, device)
+        context = sample_video_context(dataset, primary["data_ids"][idx], primary["unnormalized_targets"][idx].shape[0] + 1)
+        mesh_sets = build_mano_mesh_sets(
+            result_by_label,
+            primary_label,
+            idx,
+            mano,
+            device,
+            context=context,
+            gt_source=gt_source,
+        )
         num_frames = min(arr.shape[0] for sides in mesh_sets.values() for arr in sides.values())
         context = sample_video_context(dataset, primary["data_ids"][idx], num_frames)
         frames = read_video_frames_at(context["video_path"], context["video_frame_ids"], sample["image"])
@@ -1639,24 +1680,10 @@ def write_rgb_overlay_videos(
                 output_path=overlay_dir / f"clip_{idx:04d}_gt_keypoints_rgb_overlay.mp4",
             )
         if mano_param_overlay_debug:
-            epi = context["episode"]
-            local_frame_ids = context["local_frame_ids"]
-            param_mesh_sets = {
-                "mano_params": {
-                    "left": mano_vertices_from_labels(
-                        mano,
-                        episode_side_labels(epi, "left", local_frame_ids),
-                        is_left=True,
-                        device=device,
-                    ),
-                    "right": mano_vertices_from_labels(
-                        mano,
-                        episode_side_labels(epi, "right", local_frame_ids),
-                        is_left=False,
-                        device=device,
-                    ),
-                }
-            }
+            param_meshes = raw_mano_mesh_set_for_context(context, mano, device)
+            if param_meshes is None:
+                continue
+            param_mesh_sets = {"mano_params": param_meshes}
             write_rgb_overlay_video(
                 frames_rgb=frames,
                 mesh_sets=param_mesh_sets,
@@ -1713,6 +1740,7 @@ def run_model_evaluation(args: argparse.Namespace) -> dict[str, Any]:
                 args.label,
                 dataset,
                 args.mano_model_path,
+                gt_source=args.rgb_overlay_gt_source,
                 undistort_overlay_frames=args.undistort_overlay_frames,
                 keypoint_overlay_debug=args.keypoint_overlay_debug,
                 mano_param_overlay_debug=args.mano_param_overlay_debug,
@@ -1735,6 +1763,7 @@ def run_model_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             args.label,
             dataset,
             args.mano_model_path,
+            gt_source=args.rgb_overlay_gt_source,
             undistort_overlay_frames=args.undistort_overlay_frames,
             keypoint_overlay_debug=args.keypoint_overlay_debug,
             mano_param_overlay_debug=args.mano_param_overlay_debug,
@@ -1786,6 +1815,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand_motion_videos", action="store_true")
     parser.add_argument("--mano_motion_videos", action="store_true")
     parser.add_argument("--rgb_overlay_videos", action="store_true")
+    parser.add_argument(
+        "--rgb_overlay_gt_source",
+        choices=["raw_mano", "reconstructed_target"],
+        default="raw_mano",
+        help="Source used for the GT mesh in RGB overlays.",
+    )
     parser.add_argument("--undistort_overlay_frames", action="store_true")
     parser.add_argument("--keypoint_overlay_debug", action="store_true")
     parser.add_argument("--mano_param_overlay_debug", action="store_true")

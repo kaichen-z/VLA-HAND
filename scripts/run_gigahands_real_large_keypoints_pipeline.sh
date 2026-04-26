@@ -15,6 +15,7 @@ CONFIG="${CONFIG:-${REPO_ROOT}/vitra/configs/human_pretrain_gigahands_real_large
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/runs/gigahands_real_large_keypoints_vitra3b_linked_train}"
 VITRA_BASE_CHECKPOINT="${VITRA_BASE_CHECKPOINT:-${REPO_ROOT}/checkpoints/vitra-vla-3b.pt}"
 HF_CACHE_SEARCH_ROOT="${HF_CACHE_SEARCH_ROOT:-$(cd "${REPO_ROOT}/.." && pwd)/hf_cache}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 
 GPUS="${GPUS:-1,2}"
 NPROC="${NPROC:-2}"
@@ -28,6 +29,15 @@ CANDIDATE_POOL_FACTOR="${CANDIDATE_POOL_FACTOR:-20}"
 REQUIRE_VIDEO_EXISTS="${REQUIRE_VIDEO_EXISTS:-1}"
 REQUIRE_VIDEO_FRAME_COUNT="${REQUIRE_VIDEO_FRAME_COUNT:-1}"
 REQUIRE_KEYPOINTS="${REQUIRE_KEYPOINTS:-1}"
+REQUIRE_REAL_KEYPOINTS="${REQUIRE_REAL_KEYPOINTS:-1}"
+KEYPOINTS_SOURCE="${KEYPOINTS_SOURCE:-real}"
+ALLOW_MANO_KEYPOINT_FALLBACK="${ALLOW_MANO_KEYPOINT_FALLBACK:-0}"
+REQUIRE_BOTH_HANDS_VALID="${REQUIRE_BOTH_HANDS_VALID:-1}"
+PREFER_BIMANUAL_MOTION="${PREFER_BIMANUAL_MOTION:-1}"
+SELECT_ALL="${SELECT_ALL:-0}"
+TEST_RATIO="${TEST_RATIO:-0.05}"
+CAMERA_SCOPE="${CAMERA_SCOPE:-single}"
+SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-65000}"
 SAVE_STEPS="${SAVE_STEPS:-4000}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
@@ -65,32 +75,38 @@ ensure_vitra_base_checkpoint() {
 }
 
 prepare_subset() {
-  python tools/prepare_gigahands_real_subset.py \
+  "${PYTHON_BIN}" tools/prepare_gigahands_real_subset.py \
     --gigahands_root "${GIGAHANDS_ROOT}" \
     --num_train "${NUM_TRAIN}" \
     --num_test "${NUM_TEST}" \
     --min_frames "${MIN_FRAMES}" \
     --prefer_camera "${CAMERA}" \
-    --require_both_hands_valid \
-    --prefer_bimanual_motion \
     --candidate_pool_factor "${CANDIDATE_POOL_FACTOR}" \
     --output_manifest "${MANIFEST}" \
     --output_video_list "${VIDEO_LIST}" \
+    --keypoints_source "${KEYPOINTS_SOURCE}" \
+    --test_ratio "${TEST_RATIO}" \
+    --camera_scope "${CAMERA_SCOPE}" \
+    --seed "${SEED}" \
+    $(if [[ "${REQUIRE_BOTH_HANDS_VALID}" == "1" ]]; then echo "--require_both_hands_valid"; fi) \
+    $(if [[ "${PREFER_BIMANUAL_MOTION}" == "1" ]]; then echo "--prefer_bimanual_motion"; fi) \
+    $(if [[ "${SELECT_ALL}" == "1" ]]; then echo "--select_all"; fi) \
     $(if [[ "${REQUIRE_KEYPOINTS}" == "1" ]]; then echo "--require_keypoints"; fi) \
+    $(if [[ "${REQUIRE_REAL_KEYPOINTS}" == "1" ]]; then echo "--require_real_keypoints"; fi) \
     $(if [[ "${REQUIRE_VIDEO_EXISTS}" == "1" ]]; then echo "--require_video_exists"; fi) \
     $(if [[ "${REQUIRE_VIDEO_FRAME_COUNT}" == "1" ]]; then echo "--require_video_frame_count"; fi)
   make_unique_video_list
 }
 
 make_unique_video_list() {
-  python tools/verify_required_videos.py \
+  "${PYTHON_BIN}" tools/verify_required_videos.py \
     --root "${GIGAHANDS_ROOT}" \
     --video_list "${VIDEO_LIST}" \
     --unique_output "${UNIQUE_VIDEO_LIST}"
 }
 
 verify_videos() {
-  python tools/verify_required_videos.py \
+  "${PYTHON_BIN}" tools/verify_required_videos.py \
     --root "${GIGAHANDS_ROOT}" \
     --video_list "${VIDEO_LIST}" \
     --unique_output "${UNIQUE_VIDEO_LIST}" \
@@ -99,7 +115,7 @@ verify_videos() {
 
 convert_undistorted() {
   verify_videos
-  python data/preprocessing/convert_gigahands_to_vitra_stage1.py \
+  "${PYTHON_BIN}" data/preprocessing/convert_gigahands_to_vitra_stage1.py \
     --gigahands_root "${GIGAHANDS_ROOT}" \
     --output_root "${UNDISTORTED_OUTPUT_ROOT}" \
     --input_layout full \
@@ -107,6 +123,9 @@ convert_undistorted() {
     --split all \
     --camera auto \
     --dataset_name_prefix gigahands_real \
+    --keypoints_source "${KEYPOINTS_SOURCE}" \
+    $(if [[ "${REQUIRE_REAL_KEYPOINTS}" == "1" ]]; then echo "--require_real_keypoints"; fi) \
+    $(if [[ "${ALLOW_MANO_KEYPOINT_FALLBACK}" == "0" ]]; then echo "--no_mano_keypoint_fallback"; fi) \
     --write_video \
     --undistort \
     --clean_output
@@ -114,7 +133,7 @@ convert_undistorted() {
 
 convert_linked() {
   verify_videos
-  python data/preprocessing/convert_gigahands_to_vitra_stage1.py \
+  "${PYTHON_BIN}" data/preprocessing/convert_gigahands_to_vitra_stage1.py \
     --gigahands_root "${GIGAHANDS_ROOT}" \
     --output_root "${OUTPUT_ROOT}" \
     --input_layout full \
@@ -122,6 +141,9 @@ convert_linked() {
     --split all \
     --camera auto \
     --dataset_name_prefix gigahands_real \
+    --keypoints_source "${KEYPOINTS_SOURCE}" \
+    $(if [[ "${REQUIRE_REAL_KEYPOINTS}" == "1" ]]; then echo "--require_real_keypoints"; fi) \
+    $(if [[ "${ALLOW_MANO_KEYPOINT_FALLBACK}" == "0" ]]; then echo "--no_mano_keypoint_fallback"; fi) \
     --clean_output
   rm -rf "${OUTPUT_ROOT}/Video/GigaHands_root"
   mkdir -p "${OUTPUT_ROOT}/Video"
@@ -129,12 +151,12 @@ convert_linked() {
 }
 
 calculate_keypoint_stats() {
-  python vitra/datasets/calculate_statistics.py \
+  "${PYTHON_BIN}" vitra/datasets/calculate_statistics.py \
     --dataset_folder "${OUTPUT_ROOT}" \
     --dataset_name gigahands_real_train \
     --action_type keypoints \
-    --num_workers 0 \
-    --batch_size 16 \
+    --num_workers "${STATS_NUM_WORKERS:-0}" \
+    --batch_size "${STATS_BATCH_SIZE:-16}" \
     --save_folder "${OUTPUT_ROOT}/Annotation/statistics"
 }
 
@@ -186,10 +208,21 @@ train_timed_background() {
     RUN_ROOT="${RUN_ROOT}" \
     VITRA_BASE_CHECKPOINT="${VITRA_BASE_CHECKPOINT}" \
     HF_CACHE_SEARCH_ROOT="${HF_CACHE_SEARCH_ROOT}" \
+    PYTHON_BIN="${PYTHON_BIN}" \
     GPUS="${GPUS}" \
     NPROC="${NPROC}" \
     BATCH_SIZE="${BATCH_SIZE}" \
     TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE}" \
+    REQUIRE_KEYPOINTS="${REQUIRE_KEYPOINTS}" \
+    REQUIRE_REAL_KEYPOINTS="${REQUIRE_REAL_KEYPOINTS}" \
+    KEYPOINTS_SOURCE="${KEYPOINTS_SOURCE}" \
+    ALLOW_MANO_KEYPOINT_FALLBACK="${ALLOW_MANO_KEYPOINT_FALLBACK}" \
+    REQUIRE_BOTH_HANDS_VALID="${REQUIRE_BOTH_HANDS_VALID}" \
+    PREFER_BIMANUAL_MOTION="${PREFER_BIMANUAL_MOTION}" \
+    SELECT_ALL="${SELECT_ALL}" \
+    TEST_RATIO="${TEST_RATIO}" \
+    CAMERA_SCOPE="${CAMERA_SCOPE}" \
+    SEED="${SEED}" \
     MAX_STEPS="${MAX_STEPS}" \
     SAVE_STEPS="${SAVE_STEPS}" \
     NUM_WORKERS="${NUM_WORKERS}" \
@@ -238,6 +271,9 @@ Defaults:
   train timeout: ${TRAIN_TIMEOUT}
   save steps: ${SAVE_STEPS}
   train/test clips: ${NUM_TRAIN}/${NUM_TEST}
+  select all: ${SELECT_ALL}
+  camera scope: ${CAMERA_SCOPE}
+  keypoints source: ${KEYPOINTS_SOURCE}
   linked output dataset: ${OUTPUT_ROOT}
   undistorted output dataset: ${UNDISTORTED_OUTPUT_ROOT}
   config: ${CONFIG}
