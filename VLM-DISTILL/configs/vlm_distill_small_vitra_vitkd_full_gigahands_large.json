@@ -1,0 +1,17 @@
+{
+    "parent": "vitra/configs/vlm_distill_small_vitra_vitkd_full_gigahands.json",
+    "task_name": "vlm_distill_small_vitra_vitkd_full_gigahands_large",
+    "output_root": "runs/vlm_distill_small_vitra_vitkd_full_gigahands_large/checkpoints",
+    "log_root": "runs/vlm_distill_small_vitra_vitkd_full_gigahands_large/logs",
+    "cache_root": "runs/vlm_distill_small_vitra_vitkd_full_gigahands_large/cache",
+    "save_steps": 5000,
+    "max_saved_checkpoints": 10,
+    "trainer": {
+        "max_steps": 50000
+    },
+    "action_eval": {
+        "checkpoint_config": "vitra/configs/vlm_distill_small_vitra_vitkd_full_gigahands_large.json",
+        "label": "small_vitra_vitkd_full_large",
+        "output_dir": "runs/vlm_distill_small_vitra_vitkd_full_gigahands_large/action_eval"
+    }
+}

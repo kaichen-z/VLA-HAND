@@ -1,0 +1,17 @@
+{
+    "parent": "vitra/configs/human_pretrain_gigahands_real_large_keypoints_vitra3b_linked.json",
+    "task_name": "gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_stage1",
+    "output_root": "runs/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_train/checkpoints",
+    "log_root": "runs/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_train/logs",
+    "cache_root": "runs/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_train/cache",
+    "save_steps": 4000,
+    "trainer": {
+        "max_steps": 65000
+    },
+    "train_dataset": {
+        "data_root_dir": "datasets/vitra_gigahands_real_full_keypoints_brics001_cam0_linked",
+        "data_mix": "gigahands_real_train",
+        "statistics_dataset_name": "gigahands_real_train",
+        "action_type": "keypoints"
+    }
+}

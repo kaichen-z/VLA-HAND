@@ -1,0 +1,27 @@
+{
+    "parent": "vitra/configs/vlm_distill_encoder_student_gigahands.json",
+    "task_name": "vlm_distill_encoder_student_gigahands_action",
+    "output_root": "runs/vlm_distill_encoder_student_gigahands_action/checkpoints",
+    "log_root": "runs/vlm_distill_encoder_student_gigahands_action/logs",
+    "cache_root": "runs/vlm_distill_encoder_student_gigahands_action/cache",
+    "student_init_checkpoint": "runs/vlm_distill_encoder_student_gigahands/checkpoints/vlm_distill_encoder_student_gigahands_TB2_B1_bf16True/checkpoints/epoch=0-step=1000.ckpt/weights.pt",
+    "distill_loss_mode": "action_only",
+    "action_distill_target": "gt",
+    "distill_train_setup": {
+        "freeze_option": "encoder_student_action"
+    },
+    "train_setup": {
+        "freeze_option": "encoder_student_action"
+    },
+    "save_steps": 500,
+    "max_saved_checkpoints": 4,
+    "trainer": {
+        "max_steps": 2000
+    },
+    "action_eval": {
+        "enabled": true,
+        "checkpoint_config": "vitra/configs/vlm_distill_encoder_student_gigahands_action.json",
+        "label": "encoder_student_action",
+        "output_dir": "runs/vlm_distill_encoder_student_gigahands_action/action_eval"
+    }
+}

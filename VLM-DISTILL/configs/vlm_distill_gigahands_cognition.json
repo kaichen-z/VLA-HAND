@@ -1,0 +1,39 @@
+{
+    "parent": "vitra/configs/human_pretrain_gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked.json",
+    "task_name": "vlm_distill_gigahands_cognition_base3b",
+    "output_root": "runs/vlm_distill_gigahands_cognition/checkpoints",
+    "log_root": "runs/vlm_distill_gigahands_cognition/logs",
+    "cache_root": "runs/vlm_distill_gigahands_cognition/cache",
+    "teacher_checkpoint": "runs/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_train/checkpoints/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_stage1_TB1_B1_bf16True/checkpoints/epoch=0-step=28000.ckpt/weights.pt",
+    "student_init_checkpoint": "./checkpoints/vitra-vla-3b.pt",
+    "distill_target": "cognition_token",
+    "distill_loss_weight": 1.0,
+    "distill_train_setup": {
+        "freeze_option": "freeze_vision_encoder"
+    },
+    "save_steps": 1000,
+    "trainer": {
+        "lr_scheduler_type": "backbone-freeze-warmup",
+        "learning_rate": 1e-05,
+        "action_model_learning_rate": 1e-05,
+        "weight_decay": 0.1,
+        "max_steps": 10000,
+        "llm_freeze_step": 0
+    },
+    "action_eval": {
+        "enabled": true,
+        "config": "vitra/configs/human_pretrain_gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked.json",
+        "dataset_root": "datasets/vitra_gigahands_real_full_keypoints_brics001_cam0_linked",
+        "data_mix": "gigahands_real_test",
+        "baseline_checkpoint": "./checkpoints/vitra-vla-3b.pt",
+        "baseline_label": "base3b",
+        "teacher_reference_checkpoint": "runs/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_train/checkpoints/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_stage1_TB1_B1_bf16True/checkpoints/epoch=0-step=28000.ckpt/weights.pt",
+        "teacher_reference_label": "gigahands_teacher",
+        "label": "distilled",
+        "num_eval_clips": 20,
+        "num_ddim_steps": 10,
+        "cfg_scale": 5.0,
+        "eval_sample_strategy": "sequential",
+        "output_dir": "runs/vlm_distill_gigahands_cognition/action_eval"
+    }
+}

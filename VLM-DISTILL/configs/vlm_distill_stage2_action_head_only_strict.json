@@ -1,0 +1,26 @@
+{
+    "parent": "vitra/configs/vlm_distill_gigahands_cognition.json",
+    "task_name": "vlm_distill_stage2_action_head_only_strict",
+    "output_root": "runs/vlm_distill_stage2_action_head_only_strict/checkpoints",
+    "log_root": "runs/vlm_distill_stage2_action_head_only_strict/logs",
+    "cache_root": "runs/vlm_distill_stage2_action_head_only_strict/cache",
+    "student_init_checkpoint": "runs/vlm_distill_gigahands_cognition/checkpoints/vlm_distill_gigahands_cognition_base3b_TB2_B1_bf16True/checkpoints/epoch=0-step=1000.ckpt/weights.pt",
+    "distill_loss_mode": "action_only",
+    "action_distill_target": "gt",
+    "distill_train_setup": {
+        "freeze_option": "action_head_only_strict"
+    },
+    "save_steps": 500,
+    "max_saved_checkpoints": 4,
+    "trainer": {
+        "learning_rate": 1e-06,
+        "action_model_learning_rate": 0.0001,
+        "max_steps": 2000,
+        "llm_freeze_step": 0
+    },
+    "action_eval": {
+        "enabled": true,
+        "num_eval_clips": 20,
+        "output_dir": "runs/vlm_distill_stage2_action_head_only_strict/action_eval"
+    }
+}

@@ -1,0 +1,31 @@
+{
+    "parent": "vitra/configs/vlm_distill_encoder_student_gigahands.json",
+    "task_name": "vlm_distill_encoder_student_gigahands_joint_normalized",
+    "output_root": "runs/vlm_distill_encoder_student_gigahands_joint_normalized/checkpoints",
+    "log_root": "runs/vlm_distill_encoder_student_gigahands_joint_normalized/logs",
+    "cache_root": "runs/vlm_distill_encoder_student_gigahands_joint_normalized/cache",
+    "student_init_checkpoint": "runs/vlm_distill_encoder_student_gigahands/checkpoints/vlm_distill_encoder_student_gigahands_TB2_B1_bf16True/checkpoints/epoch=0-step=1000.ckpt/weights.pt",
+    "distill_loss_mode": "normalized",
+    "action_distill_target": "gt",
+    "loss_normalization": {
+        "ema_decay": 0.99,
+        "eps": 1e-08
+    },
+    "distill_train_setup": {
+        "freeze_option": "encoder_student_action"
+    },
+    "train_setup": {
+        "freeze_option": "encoder_student_action"
+    },
+    "save_steps": 500,
+    "max_saved_checkpoints": 4,
+    "trainer": {
+        "max_steps": 2000
+    },
+    "action_eval": {
+        "enabled": true,
+        "checkpoint_config": "vitra/configs/vlm_distill_encoder_student_gigahands_joint_normalized.json",
+        "label": "encoder_student_joint",
+        "output_dir": "runs/vlm_distill_encoder_student_gigahands_joint_normalized/action_eval"
+    }
+}

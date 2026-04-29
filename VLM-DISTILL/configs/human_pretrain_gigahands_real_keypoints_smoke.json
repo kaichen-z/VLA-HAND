@@ -1,0 +1,20 @@
+{
+    "parent": "vitra/configs/human_pretrain_gigahands_real_large_keypoints_vitra3b_linked.json",
+    "task_name": "gigahands_real_keypoints_smoke",
+    "output_root": "runs/gigahands_real_keypoints_smoke/checkpoints",
+    "log_root": "runs/gigahands_real_keypoints_smoke/logs",
+    "cache_root": "runs/gigahands_real_keypoints_smoke/cache",
+    "save_steps": 100000,
+    "total_batch_size": 1,
+    "trainer": {
+        "max_steps": 5
+    },
+    "train_dataset": {
+        "data_root_dir": "datasets/vitra_gigahands_real_keypoints_smoke",
+        "data_mix": "gigahands_real_train",
+        "num_workers": 0,
+        "prefetch_factor": null,
+        "action_type": "keypoints",
+        "statistics_dataset_name": "gigahands_real_train"
+    }
+}

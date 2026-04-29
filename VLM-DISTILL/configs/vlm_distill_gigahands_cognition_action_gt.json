@@ -1,0 +1,19 @@
+{
+    "parent": "vitra/configs/vlm_distill_gigahands_cognition.json",
+    "task_name": "vlm_distill_gigahands_cognition_action_gt_step5000",
+    "output_root": "runs/vlm_distill_gigahands_cognition_action_gt/checkpoints",
+    "log_root": "runs/vlm_distill_gigahands_cognition_action_gt/logs",
+    "cache_root": "runs/vlm_distill_gigahands_cognition_action_gt/cache",
+    "student_init_checkpoint": "runs/vlm_distill_gigahands_cognition/checkpoints/vlm_distill_gigahands_cognition_base3b_TB2_B1_bf16True/checkpoints/epoch=0-step=5000.ckpt/weights.pt",
+    "cognition_loss_weight": 1.0,
+    "action_loss_weight": 1.0,
+    "action_distill_target": "gt",
+    "max_saved_checkpoints": 2,
+    "save_steps": 1000,
+    "trainer": {
+        "max_steps": 3000
+    },
+    "action_eval": {
+        "enabled": false
+    }
+}

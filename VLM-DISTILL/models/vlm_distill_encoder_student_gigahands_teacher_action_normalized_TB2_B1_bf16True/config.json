@@ -1,0 +1,120 @@
+{
+  "vla_name": "VITRA_EncoderStudent",
+  "task_name": "vlm_distill_encoder_student_gigahands_teacher_action_normalized",
+  "model": "vitra_paligemma2",
+  "fwd_pred_next_n": 16,
+  "seed": 42,
+  "batch_size": 1,
+  "output_root": "/home/hannahyao24/scratch/hannahyao24/projects/VLA-HAND/VLM-DISTILL/models",
+  "log_root": "runs/vlm_distill_encoder_student_gigahands_teacher_action_normalized/logs",
+  "cache_root": "runs/vlm_distill_encoder_student_gigahands_teacher_action_normalized/cache/vitra_paligemma2",
+  "model_load_path": null,
+  "pretrain_path": "./checkpoints/vitra-vla-3b.pt",
+  "resume": false,
+  "wandb_project": "vitra-gigahands-real-keypoints",
+  "wandb_entity": "",
+  "save_steps": 500,
+  "epoch_save_interval": 100000,
+  "total_batch_size": 2,
+  "use_bf16": true,
+  "use_fov": true,
+  "untied_cognition_token": true,
+  "use_state": "DiT",
+  "loss_type": "human",
+  "train_setup": {
+    "freeze_option": "encoder_student_action"
+  },
+  "state_encoder": {
+    "state_dim": 212
+  },
+  "action_model": {
+    "model_type": "DiT-S",
+    "token_size": 2304,
+    "action_dim": 192,
+    "hidden_size": 384
+  },
+  "vlm": {
+    "type": "PaliGemmaForConditionalGeneration",
+    "name": "paligemma",
+    "pretrained_model_name_or_path": "google/paligemma2-3b-mix-224"
+  },
+  "trainer": {
+    "sharding_strategy": "shard-grad-op",
+    "strategy": "fsdp_paligemma_with_checkpointing",
+    "lr_scheduler_type": "backbone-freeze-warmup",
+    "gradient_clip_val": 1.0,
+    "learning_rate": 1e-05,
+    "weight_decay": 0.1,
+    "max_epochs": 100000,
+    "max_steps": 2000,
+    "reduce_in_full_precision": true,
+    "enable_mixed_precision_training": false,
+    "enable_gradient_checkpointing": true,
+    "action_model_learning_rate": 0.0001,
+    "llm_freeze_step": 0,
+    "warmup_ratio": null
+  },
+  "train_dataset": {
+    "data_root_dir": "datasets/vitra_gigahands_real_full_keypoints_brics001_cam0_linked",
+    "augmentation": false,
+    "set_none_ratio": 0.0,
+    "data_mix": "gigahands_real_train",
+    "num_workers": 2,
+    "prefetch_factor": null,
+    "flip_augmentation": 1.0,
+    "action_type": "keypoints",
+    "use_rel": false,
+    "clip_len": null,
+    "normalization": true,
+    "state_mask_prob": 0.0,
+    "statistics_dataset_name": "gigahands_real_train"
+  },
+  "repeated_diffusion_steps": 8,
+  "parent": "vitra/configs/vlm_distill_encoder_student_gigahands.json",
+  "teacher_config": "vitra/configs/human_pretrain_gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked.json",
+  "teacher_checkpoint": "runs/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_train/checkpoints/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_stage1_TB1_B1_bf16True/checkpoints/epoch=0-step=28000.ckpt/weights.pt",
+  "student_init_checkpoint": "runs/vlm_distill_encoder_student_gigahands/checkpoints/vlm_distill_encoder_student_gigahands_TB2_B1_bf16True/checkpoints/epoch=0-step=10000.ckpt/weights.pt",
+  "distill_loss_mode": "normalized",
+  "distill_loss_weight": 1.0,
+  "action_loss_weight": 0.0,
+  "distill_train_setup": {
+    "freeze_option": "encoder_student_action"
+  },
+  "student_vlm": {
+    "student_model_type": "encoder_vlm",
+    "vision_encoder_name": "facebook/dinov2-base",
+    "freeze_vision_encoder": true,
+    "text_encoder_name": "distilbert-base-uncased",
+    "fusion_hidden_size": 1024,
+    "student_output_size": 2304,
+    "include_state_in_fusion": true
+  },
+  "max_saved_checkpoints": 4,
+  "action_eval": {
+    "enabled": true,
+    "config": "vitra/configs/human_pretrain_gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked.json",
+    "dataset_root": "datasets/vitra_gigahands_real_full_keypoints_brics001_cam0_linked",
+    "data_mix": "gigahands_real_test",
+    "checkpoint_config": "vitra/configs/vlm_distill_encoder_student_gigahands_teacher_action_normalized.json",
+    "teacher_config": "vitra/configs/human_pretrain_gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked.json",
+    "baseline_config": "vitra/configs/human_pretrain_gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked.json",
+    "baseline_checkpoint": "./checkpoints/vitra-vla-3b.pt",
+    "baseline_label": "base3b",
+    "teacher_reference_checkpoint": "runs/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_train/checkpoints/gigahands_real_full_keypoints_brics001_cam0_vitra3b_linked_stage1_TB1_B1_bf16True/checkpoints/epoch=0-step=28000.ckpt/weights.pt",
+    "teacher_reference_label": "gigahands_teacher",
+    "label": "encoder_student_teacher_action",
+    "num_eval_clips": 20,
+    "num_ddim_steps": 10,
+    "cfg_scale": 5.0,
+    "eval_sample_strategy": "sequential",
+    "output_dir": "runs/vlm_distill_encoder_student_gigahands_teacher_action_normalized/action_eval"
+  },
+  "action_distill_target": "teacher",
+  "loss_normalization": {
+    "ema_decay": 0.99,
+    "eps": 1e-08
+  },
+  "save_checkpoint": true,
+  "num_workers": null,
+  "prefetch_factor": null
+}

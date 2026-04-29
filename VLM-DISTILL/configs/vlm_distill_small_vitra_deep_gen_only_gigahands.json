@@ -1,0 +1,18 @@
+{
+    "parent": "vitra/configs/vlm_distill_small_vitra_vitkd_full_gigahands.json",
+    "task_name": "vlm_distill_small_vitra_deep_gen_only_gigahands",
+    "output_root": "runs/vlm_distill_small_vitra_deep_gen_only_gigahands/checkpoints",
+    "log_root": "runs/vlm_distill_small_vitra_deep_gen_only_gigahands/logs",
+    "cache_root": "runs/vlm_distill_small_vitra_deep_gen_only_gigahands/cache",
+    "vitkd": {
+        "use_cognition_loss": true,
+        "use_shallow_mimic_loss": false,
+        "use_deep_generation_loss": true,
+        "use_direct_deep_mimic_loss": false
+    },
+    "action_eval": {
+        "checkpoint_config": "vitra/configs/vlm_distill_small_vitra_deep_gen_only_gigahands.json",
+        "label": "small_vitra_deep_gen_only",
+        "output_dir": "runs/vlm_distill_small_vitra_deep_gen_only_gigahands/action_eval"
+    }
+}
