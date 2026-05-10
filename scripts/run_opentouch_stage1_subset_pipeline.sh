@@ -9,6 +9,10 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${DATA_ROOT}/vitra_opentouch_keypoint}"
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/runs/opentouch_keypoint_subset}"
 EVAL_ROOT="${EVAL_ROOT:-${REPO_ROOT}/runs/opentouch_keypoint_subset_eval}"
 CONFIG="${CONFIG:-${REPO_ROOT}/vitra/configs/human_pretrain_opentouch_keypoint_subset.json}"
+LABELS_PATH="${LABELS_PATH:-}"
+CONTACT_MANIFEST="${CONTACT_MANIFEST:-${OUTPUT_ROOT}/opentouch_contact_subset_manifest.jsonl}"
+FILTER_CONTACT_KEYWORDS="${FILTER_CONTACT_KEYWORDS:-0}"
+TOUCH_ALIGNMENT_TOLERANCE="${TOUCH_ALIGNMENT_TOLERANCE:-}"
 GPUS="${GPUS:-0,1,3,4}"
 NPROC="${NPROC:-4}"
 MIN_FRAMES="${MIN_FRAMES:-17}"
@@ -127,6 +131,16 @@ PY
 
 convert_subset() {
   verify_raw
+  extra_args=()
+  if [[ -n "${LABELS_PATH}" ]]; then
+    extra_args+=(--labels_path "${LABELS_PATH}")
+  fi
+  if [[ "${FILTER_CONTACT_KEYWORDS}" == "1" ]]; then
+    extra_args+=(--filter_contact_keywords --contact_manifest_path "${CONTACT_MANIFEST}")
+  fi
+  if [[ -n "${TOUCH_ALIGNMENT_TOLERANCE}" ]]; then
+    extra_args+=(--touch_alignment_tolerance "${TOUCH_ALIGNMENT_TOLERANCE}")
+  fi
   python data/preprocessing/convert_opentouch_to_vitra_stage1.py \
     --opentouch_root "${OPENTOUCH_ROOT}" \
     --output_root "${OUTPUT_ROOT}" \
@@ -134,7 +148,8 @@ convert_subset() {
     --train_ratio "${TRAIN_RATIO}" \
     --max_files "${MAX_FILES}" \
     --max_clips "${MAX_CLIPS}" \
-    --write_video
+    --write_video \
+    "${extra_args[@]}"
 }
 
 calculate_stats() {
@@ -205,6 +220,9 @@ Defaults:
   DATA_ROOT=${DATA_ROOT}
   OPENTOUCH_ROOT=${OPENTOUCH_ROOT}
   OUTPUT_ROOT=${OUTPUT_ROOT}
+  LABELS_PATH=${LABELS_PATH}
+  FILTER_CONTACT_KEYWORDS=${FILTER_CONTACT_KEYWORDS}
+  CONTACT_MANIFEST=${CONTACT_MANIFEST}
   MAX_FILES=${MAX_FILES}
   MAX_CLIPS=${MAX_CLIPS}
 EOF

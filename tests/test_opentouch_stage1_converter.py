@@ -27,7 +27,13 @@ def encode_jpeg(frame: np.ndarray) -> bytes:
     return encoded.tobytes()
 
 
-def write_opentouch_fixture(root: Path, frame_count: int = 20) -> Path:
+def write_opentouch_fixture(
+    root: Path,
+    frame_count: int = 20,
+    include_left: bool = False,
+    clip_id: str = "clip_000001",
+    separate_touch_timestamps: bool = False,
+) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     h5_path = root / "synthetic_session.hdf5"
     frames = []
@@ -42,16 +48,30 @@ def write_opentouch_fixture(root: Path, frame_count: int = 20) -> Path:
     landmarks[:, :, 2] = 1.0
     landmarks[:, :, 0] = np.linspace(0.0, 0.1, frame_count)[:, None]
     landmarks[:, 0, :] += np.array([0.2, 0.0, 0.0], dtype=np.float32)
+    left_landmarks = landmarks.copy()
+    left_landmarks[:, :, 0] *= -1.0
 
     with h5py.File(h5_path, "w") as handle:
-        clip = handle.create_group("data").create_group("clip_000001")
+        clip = handle.create_group("data").create_group(clip_id)
         vlen = h5py.vlen_dtype(np.dtype("uint8"))
         jpeg_ds = clip.create_dataset("rgb_images_jpeg", (frame_count,), dtype=vlen)
         for idx, encoded in enumerate(frames):
             jpeg_ds[idx] = encoded
         clip.create_dataset("right_hand_landmarks", data=landmarks)
-        clip.create_dataset("right_pressure", data=np.ones((frame_count, 16, 16), dtype=np.float32))
+        if separate_touch_timestamps:
+            right_pressure = np.arange(frame_count, dtype=np.float32)[:, None, None] * np.ones((frame_count, 16, 16), dtype=np.float32)
+        else:
+            right_pressure = np.ones((frame_count, 16, 16), dtype=np.float32)
+        clip.create_dataset("right_pressure", data=right_pressure)
+        if include_left:
+            clip.create_dataset("left_hand_landmarks", data=left_landmarks)
+            clip.create_dataset("left_pressure", data=np.full((frame_count, 16, 16), 2.0, dtype=np.float32))
         clip.create_dataset("timestamps", data=np.arange(frame_count, dtype=np.float64) / 30.0)
+        if separate_touch_timestamps:
+            touch_timestamps = np.arange(frame_count, dtype=np.float64) / 30.0
+            touch_timestamps[5:] += 0.004
+            touch_timestamps[-1] += 1.0
+            clip.create_dataset("touch_timestamps", data=touch_timestamps)
 
     return h5_path
 
@@ -87,6 +107,74 @@ def test_opentouch_conversion_writes_keypoint_stage1_episode(tmp_path):
     assert not epi["left"]["kept_frames"].any()
     assert epi["text"]["right"][0][0] == "Press the textured surface with the right hand."
     assert epi["opentouch"]["right_pressure"].shape == (20, 16, 16)
+    assert epi["opentouch"]["touch_pressure"].shape == (20, 2, 16, 16)
+    assert epi["opentouch"]["touch_mask"].shape == (20, 2)
+    assert not epi["opentouch"]["touch_mask"][:, 0].any()
+    assert epi["opentouch"]["touch_mask"][:, 1].all()
+    assert "video_timestamps" in epi["opentouch"]
+    assert "touch_timestamps" in epi["opentouch"]
+    assert "touch_alignment_valid" in epi["opentouch"]
+
+
+def test_opentouch_conversion_preserves_both_hand_touch_and_manifest(tmp_path):
+    converter = load_converter()
+    input_root = tmp_path / "opentouch_raw"
+    output_root = tmp_path / "vitra_opentouch_keypoint"
+    manifest_path = tmp_path / "contact_manifest.jsonl"
+    write_opentouch_fixture(input_root, include_left=True, clip_id="clip_keep")
+    labels = input_root / "labels.csv"
+    labels.write_text("clip_id,action,object_name\nclip_keep,grip,block\n", encoding="utf-8")
+
+    report = converter.convert_opentouch_to_vitra_stage1(
+        opentouch_root=input_root,
+        output_root=output_root,
+        labels_path=labels,
+        min_frames=17,
+        train_ratio=1.0,
+        write_video=True,
+        filter_contact_keywords=True,
+        contact_manifest_path=manifest_path,
+    )
+
+    assert report["num_clips_seen"] == 1
+    records = [json.loads(line) for line in manifest_path.read_text().splitlines()]
+    assert records[0]["clip_id"] == "clip_keep"
+    assert records[0]["matched_keyword"] == "grip"
+
+    episode_path = next((output_root / "Annotation" / "opentouch_keypoint_train" / "episodic_annotations").glob("*.npy"))
+    epi = np.load(episode_path, allow_pickle=True).item()
+    assert epi["left"]["kept_frames"].all()
+    assert epi["right"]["kept_frames"].all()
+    assert epi["opentouch"]["left_pressure"].shape == (20, 16, 16)
+    assert epi["opentouch"]["right_pressure"].shape == (20, 16, 16)
+    assert np.allclose(epi["opentouch"]["touch_pressure"][:, 0], 2.0)
+    assert np.allclose(epi["opentouch"]["touch_pressure"][:, 1], 1.0)
+    assert epi["opentouch"]["touch_mask"].all()
+
+
+def test_opentouch_contact_filter_skips_nonmatching_labels(tmp_path):
+    converter = load_converter()
+    input_root = tmp_path / "opentouch_raw"
+    output_root = tmp_path / "vitra_opentouch_keypoint"
+    manifest_path = tmp_path / "contact_manifest.jsonl"
+    write_opentouch_fixture(input_root, clip_id="clip_skip")
+    labels = input_root / "labels.json"
+    labels.write_text(json.dumps({"clip_skip": {"action": "observe", "object_name": "surface"}}))
+
+    report = converter.convert_opentouch_to_vitra_stage1(
+        opentouch_root=input_root,
+        output_root=output_root,
+        labels_path=labels,
+        min_frames=17,
+        train_ratio=1.0,
+        write_video=False,
+        filter_contact_keywords=True,
+        contact_manifest_path=manifest_path,
+    )
+
+    assert report["num_clips_seen"] == 0
+    assert report["num_episodes_written"] == 0
+    assert manifest_path.read_text() == ""
 
 
 def test_converted_opentouch_can_be_read_as_keypoint_frame_dataset(tmp_path):
@@ -187,6 +275,39 @@ def test_opentouch_dataset_registration_mentions_keypoint_paths():
     assert '"opentouch_keypoint_train"' in mixtures_py
     assert '"opentouch_keypoint_test"' in mixtures_py
     assert "opentouch_keypoint_train" in stats_py
+
+
+def test_opentouch_conversion_aligns_touch_timestamps_with_tolerance(tmp_path):
+    converter = load_converter()
+    input_root = tmp_path / "opentouch_raw"
+    output_root = tmp_path / "vitra_opentouch_keypoint"
+    write_opentouch_fixture(input_root, separate_touch_timestamps=True)
+
+    report = converter.convert_opentouch_to_vitra_stage1(
+        opentouch_root=input_root,
+        output_root=output_root,
+        min_frames=17,
+        train_ratio=1.0,
+        write_video=False,
+        touch_alignment_tolerance=0.01,
+    )
+
+    assert report["num_episodes_written"] == 1
+    episode_path = next((output_root / "Annotation" / "opentouch_keypoint_train" / "episodic_annotations").glob("*.npy"))
+    epi = np.load(episode_path, allow_pickle=True).item()
+    touch = epi["opentouch"]
+    assert touch["touch_alignment_valid"][:-1].all()
+    assert not touch["touch_alignment_valid"][-1]
+    assert touch["touch_aligned_indices"][:5].tolist() == [0, 1, 2, 3, 4]
+    assert np.allclose(touch["touch_pressure"][:5, 1, 0, 0], [0, 1, 2, 3, 4])
+    assert not touch["touch_mask"][-1].any()
+
+
+def test_opentouch_conversion_normalizes_nanosecond_timestamps(tmp_path):
+    converter = load_converter()
+    raw = np.array([1_000_000_000, 1_033_333_333, 1_066_666_666], dtype=np.int64)
+    seconds = converter.normalize_timestamps_seconds(raw)
+    assert np.allclose(np.diff(seconds), [1.0 / 30.0, 1.0 / 30.0], atol=1e-3)
 
 
 def test_opentouch_keypoint_statistics_handle_masked_left_hand(tmp_path):

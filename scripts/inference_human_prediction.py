@@ -28,6 +28,22 @@ sys.path.insert(0, str(repo_root))
 from visualization.visualize_core import HandVisualizer, normalize_camera_intrinsics, save_to_video, Renderer, process_single_hand_labels
 from visualization.visualize_core import Config as HandConfig
 
+
+def load_touch_payload(path):
+    if path is None:
+        return None, None
+    with np.load(path, allow_pickle=False) as payload:
+        if "touch_pressure" not in payload or "touch_mask" not in payload:
+            raise KeyError(f"{path} must contain touch_pressure and touch_mask arrays")
+        touch_pressure = payload["touch_pressure"].astype(np.float32)
+        touch_mask = payload["touch_mask"].astype(bool)
+    if touch_pressure.ndim != 4 or touch_pressure.shape[1:] != (2, 16, 16):
+        raise ValueError(f"touch_pressure must be shaped [H,2,16,16], got {touch_pressure.shape}")
+    if touch_mask.ndim != 2 or touch_mask.shape[1] != 2:
+        raise ValueError(f"touch_mask must be shaped [H,2], got {touch_mask.shape}")
+    return touch_pressure, touch_mask
+
+
 def main():
     """
     Main execution function for hand action prediction and visualization.
@@ -79,6 +95,9 @@ def main():
     parser.add_argument('--instruction', type=str, default="Left: Put the trash into the garbage. Right: None.", help='Text instruction for hand motion')
     parser.add_argument('--sample_times', type=int, default=4, help='Number of action samples to generate for diversity')
     parser.add_argument('--fps', type=int, default=8, help='Frames per second for output video')
+    parser.add_argument('--touch_editor_checkpoint', type=str, default=None, help='Optional trained touch-editor checkpoint for mid-chunk guidance')
+    parser.add_argument('--touch_data_path', type=str, default=None, help='Optional .npz containing touch_pressure [H,2,16,16] and touch_mask [H,2]')
+    parser.add_argument('--touch_edit_times', type=float, nargs='+', default=[0.33, 0.66], help='Second offsets for touch guidance within the action chunk')
     
     # Advanced Options
     parser.add_argument('--save_state_local', action='store_true', help='Save hand state locally as .npy file')
@@ -101,6 +120,8 @@ def main():
         configs['model_load_path'] = args.model_path
     if args.statistics_path is not None:
         configs['statistics_path'] = args.statistics_path
+    if args.touch_editor_checkpoint is not None:
+        configs['touch_editor_checkpoint'] = args.touch_editor_checkpoint
 
     # Check if a precomputed hand reconstruction .npy (same stem as image) exists.
     image_path_obj = Path(args.image_path)
@@ -220,6 +241,9 @@ def main():
 
         # Use instruction from command-line argument
         instruction = args.instruction
+        touch_pressure, touch_mask = load_touch_payload(args.touch_data_path)
+        if touch_pressure is not None and args.touch_editor_checkpoint is None:
+            raise ValueError("--touch_data_path requires --touch_editor_checkpoint")
 
         # Model inference using service (includes normalization, padding, and unnormalization)
         print(f"Running VLA inference...")
@@ -234,6 +258,10 @@ def main():
             num_ddim_steps=10,
             cfg_scale=5.0,
             sample_times=sample_times,
+            touch_pressure=touch_pressure,
+            touch_mask=touch_mask,
+            touch_fps=args.fps,
+            touch_edit_times=args.touch_edit_times,
         )
         
         fx_exo = intrinsics[0, 0]
@@ -492,6 +520,7 @@ def _vla_inference_worker(configs_dict, task_queue, result_queue):
     
     model = None
     normalizer = None
+    touch_editor = None
     
     try:
         # Load model and normalizer once
@@ -499,6 +528,12 @@ def _vla_inference_worker(configs_dict, task_queue, result_queue):
         model = load_model(configs_dict).cuda()
         model.eval()
         normalizer = load_normalizer(configs_dict)
+        touch_editor_checkpoint = configs_dict.get('touch_editor_checkpoint')
+        if touch_editor_checkpoint is not None:
+            from vitra.touch_editor.guidance import load_touch_editor
+
+            print("[VLA Process] Loading touch editor...")
+            touch_editor = load_touch_editor(touch_editor_checkpoint, device="cuda")
         print(f"[VLA Process] VLA model ready.")
         
         # Signal ready
@@ -523,6 +558,10 @@ def _vla_inference_worker(configs_dict, task_queue, result_queue):
                     num_ddim_steps = task.get('num_ddim_steps', 10)
                     cfg_scale = task.get('cfg_scale', 5.0)
                     sample_times = task.get('sample_times', 1)
+                    touch_pressure = task.get('touch_pressure')
+                    touch_mask = task.get('touch_mask')
+                    touch_fps = task.get('touch_fps', 8.0)
+                    touch_edit_times = task.get('touch_edit_times', [0.33, 0.66])
                     
                     # Normalize state
                     norm_state = normalizer.normalize_state(state.copy())
@@ -563,6 +602,25 @@ def _vla_inference_worker(configs_dict, task_queue, result_queue):
                         fov=fov,
                         sample_times=sample_times,
                     )
+
+                    if touch_editor is not None and touch_pressure is not None and touch_mask is not None:
+                        from vitra.touch_editor.guidance import apply_touch_guidance_schedule
+
+                        norm_action_torch = torch.as_tensor(norm_action, dtype=torch.float32, device="cuda")
+                        touch_pressure_torch = torch.as_tensor(touch_pressure, dtype=torch.float32, device="cuda")
+                        touch_mask_torch = torch.as_tensor(touch_mask, dtype=torch.bool, device="cuda")
+                        guided = apply_touch_guidance_schedule(
+                            editor=touch_editor,
+                            a_base=norm_action_torch,
+                            current_state=unified_state,
+                            current_state_mask=unified_state_mask,
+                            touch_pressure=touch_pressure_torch,
+                            touch_mask=touch_mask_torch,
+                            action_mask=unified_action_mask,
+                            fps=touch_fps,
+                            edit_times=touch_edit_times,
+                        )
+                        norm_action = guided.a_edit.detach().cpu().numpy()
                     
                     # Extract and denormalize action
                     norm_action = norm_action[:, :, :102]
@@ -603,6 +661,8 @@ def _vla_inference_worker(configs_dict, task_queue, result_queue):
             del model
         if normalizer is not None:
             del normalizer
+        if touch_editor is not None:
+            del touch_editor
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         print("[VLA Process] Cleaned up and exiting")
@@ -682,8 +742,9 @@ class VLAInferenceService:
         elif ready_msg['type'] == 'error':
             raise RuntimeError(f"Failed to initialize VLA model: {ready_msg['error']}")
     
-    def predict(self, image, instruction, state, state_mask, action_mask, 
-                fov, num_ddim_steps=10, cfg_scale=5.0, sample_times=1):
+    def predict(self, image, instruction, state, state_mask, action_mask,
+                fov, num_ddim_steps=10, cfg_scale=5.0, sample_times=1,
+                touch_pressure=None, touch_mask=None, touch_fps=8.0, touch_edit_times=None):
         """Request action prediction with state normalization and padding"""
 
         self.task_queue.put({
@@ -697,6 +758,10 @@ class VLAInferenceService:
             'num_ddim_steps': num_ddim_steps,
             'cfg_scale': cfg_scale,
             'sample_times': sample_times,
+            'touch_pressure': touch_pressure,
+            'touch_mask': touch_mask,
+            'touch_fps': touch_fps,
+            'touch_edit_times': touch_edit_times if touch_edit_times is not None else [0.33, 0.66],
         })
         
         result = self.result_queue.get()

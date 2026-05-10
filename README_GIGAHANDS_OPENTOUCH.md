@@ -178,6 +178,146 @@ STAGE=stats bash scripts/run_opentouch_stage1_subset_pipeline.sh
 STAGE=train_smoke bash scripts/run_opentouch_stage1_subset_pipeline.sh
 ```
 
+To build the contact-rich subset for touch-editor work, pass OpenTouch labels and enable keyword filtering:
+
+```bash
+LABELS_PATH=datasets/opentouch_raw/final_annotations/<labels-file>.csv \
+FILTER_CONTACT_KEYWORDS=1 \
+STAGE=convert bash scripts/run_opentouch_stage1_subset_pipeline.sh
+```
+
+If OpenTouch tactile timestamps are separate from RGB/state timestamps, the converter aligns each video frame to the nearest tactile frame. Override the default half-frame tolerance when needed:
+
+```bash
+TOUCH_ALIGNMENT_TOLERANCE=0.02 \
+STAGE=convert bash scripts/run_opentouch_stage1_subset_pipeline.sh
+```
+
+The default retained verbs are:
+
+```text
+grasp grip hold press push pull lift place insert remove open close
+```
+
+The converter writes `opentouch_contact_subset_manifest.jsonl` and preserves tactile tensors under each episode's `opentouch` payload:
+
+```text
+touch_pressure: T x 2 x 16 x 16
+touch_mask:     T x 2
+```
+
+The payload also records timestamp alignment metadata:
+
+```text
+video_timestamps
+touch_timestamps
+touch_aligned_indices
+touch_aligned_timestamps
+touch_alignment_valid
+```
+
+Cache frozen VLA-Hand base actions on the converted OpenTouch subset:
+
+```bash
+python scripts/cache_touch_editor_base_actions.py \
+  --checkpoint LeoJiangOR/vitra-gigahands-keypoints-step140000 \
+  --dataset_root datasets/vitra_opentouch_keypoint \
+  --data_mix opentouch_keypoint_train \
+  --cache_root runs/touch_editor_cache \
+  --random_edit_start
+```
+
+The cache script uses the same future action window as VITRA and stores aligned touch windows plus action/touch timestamp metadata. The residual editor training entrypoint expects cached frozen-VLA samples containing `A_base`, VITRA-format `A_target`, action masks, current state, future edit masks, and touch windows:
+
+```bash
+python scripts/train_touch_editor.py \
+  --cache_root runs/touch_editor_cache \
+  --output_dir runs/touch_editor
+```
+
+Evaluate touch guidance at real second offsets inside each cached VITRA chunk:
+
+```bash
+python scripts/evaluate_touch_guided_actions.py \
+  --cache_root runs/touch_editor_cache \
+  --touch_editor_checkpoint runs/touch_editor/latest.pt \
+  --output_path runs/touch_editor_eval/metrics.json \
+  --fps 8 \
+  --edit_times 0.33 0.66
+```
+
+This reports masked normalized-action MSE for the frozen base action and for the sequential touch-edited actions. The edit indices are computed from actual FPS, so at `fps=8` the default edits land at chunk indices `3` and `5`.
+
+Evaluate frozen VITRA against official GigaHands/VITRA ground-truth actions separately:
+
+```bash
+python scripts/evaluate_vitra_gt_actions.py \
+  --checkpoint LeoJiangOR/vitra-gigahands-keypoints-step140000 \
+  --dataset_root datasets/vitra_gigahands_real_full_keypoints_brics001_cam0_linked \
+  --data_mix gigahands_real_test \
+  --statistics_dataset_name gigahands_real_train \
+  --output_path runs/vitra_gt_eval_gigahands_test/metrics.json
+```
+
+This target is the normalized GigaHands/VITRA `action_list`, not OpenTouch landmarks. GigaHands does not include tactile pressure, so this baseline should be reported separately from OpenTouch touch-editor metrics.
+
+Two-stage residual editor training:
+
+```bash
+# Stage 1: learn the VITRA residual prior from official GigaHands targets.
+python scripts/cache_touch_editor_base_actions.py \
+  --checkpoint LeoJiangOR/vitra-gigahands-keypoints-step140000 \
+  --dataset_root datasets/vitra_gigahands_real_full_keypoints_brics001_cam0_linked \
+  --data_mix gigahands_real_train \
+  --statistics_dataset_name gigahands_real_train \
+  --cache_root runs/touch_editor_cache_gigahands_train \
+  --touch_mode zeros \
+  --random_edit_start
+
+python scripts/train_touch_editor.py \
+  --cache_root runs/touch_editor_cache_gigahands_train \
+  --output_dir runs/touch_editor_stage1_gigahands
+
+# Stage 2: fine-tune with real OpenTouch pressure.
+python scripts/train_touch_editor.py \
+  --cache_root runs/touch_editor_cache \
+  --output_dir runs/touch_editor_stage2_opentouch \
+  --init_checkpoint runs/touch_editor_stage1_gigahands/latest.pt
+```
+
+The cache stores both `a_target` and `residual_target = a_target - a_base`. Training minimizes the explicit residual loss on the editable future suffix:
+
+```text
+L_total = L_residual + 0.01 L_delta + 0.05 L_smooth + 1.0 L_mask
+```
+
+For one-shot inference visualization, provide a saved tactile `.npz` payload with:
+
+```text
+touch_pressure: H x 2 x 16 x 16
+touch_mask:     H x 2
+```
+
+Then pass the trained editor and touch payload to the inference script:
+
+```bash
+python scripts/inference_human_prediction.py \
+  --config_path vitra/configs/human_pretrain_gigahands_real_full_keypoints_vitra3b_linked.json \
+  --model_path <vitra-weights.pt-or-checkpoint-dir> \
+  --image_path <input-image> \
+  --use_right \
+  --touch_editor_checkpoint runs/touch_editor/latest.pt \
+  --touch_data_path <touch-window.npz> \
+  --touch_edit_times 0.33 0.66 \
+  --fps 8
+```
+
+The inference hook edits normalized VITRA actions before denormalization:
+
+```text
+A_edit = A_base + future_mask * action_mask * DeltaA
+```
+
 Converted output:
 
 ```text
