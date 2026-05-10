@@ -29,10 +29,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--init_checkpoint", type=Path, default=None, help="Optional editor checkpoint to initialize from.")
-    parser.add_argument("--lambda_dev", type=float, default=0.0, help="Deprecated duplicate residual-size penalty; prefer lambda_delta.")
+    parser.add_argument("--lambda_dev", type=float, default=0.1)
     parser.add_argument("--lambda_delta", type=float, default=0.01)
     parser.add_argument("--lambda_smooth", type=float, default=0.05)
     parser.add_argument("--lambda_mask", type=float, default=1.0)
+    parser.add_argument(
+        "--touch_ablation",
+        choices=("none", "zero_touch"),
+        default="none",
+        help="Optionally ablate tactile input during training. Use zero_touch for a no-touch editor.",
+    )
     return parser.parse_args()
 
 
@@ -41,6 +47,16 @@ def serializable_args(args: argparse.Namespace) -> dict[str, object]:
     for key, value in vars(args).items():
         out[key] = str(value) if isinstance(value, Path) else value
     return out
+
+
+def apply_touch_training_ablation(
+    touch_pressure: torch.Tensor,
+    touch_mask: torch.Tensor,
+    touch_ablation: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if touch_ablation == "zero_touch":
+        return torch.zeros_like(touch_pressure), torch.zeros_like(touch_mask)
+    return touch_pressure, touch_mask
 
 
 def main() -> None:
@@ -62,12 +78,17 @@ def main() -> None:
         while step < args.max_steps:
             for batch in loader:
                 batch = {key: value.to(args.device) if hasattr(value, "to") else value for key, value in batch.items()}
+                touch_pressure, touch_mask = apply_touch_training_ablation(
+                    batch["touch_pressure"],
+                    batch["touch_mask"],
+                    args.touch_ablation,
+                )
                 delta = model(
                     batch["a_base"],
                     batch["current_state"],
                     batch["current_state_mask"],
-                    batch["touch_pressure"],
-                    batch["touch_mask"],
+                    touch_pressure,
+                    touch_mask,
                     batch["chunk_phase"],
                     batch["future_mask"],
                     batch["action_mask"],

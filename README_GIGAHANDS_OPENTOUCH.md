@@ -278,12 +278,40 @@ python scripts/train_touch_editor.py \
   --cache_root runs/touch_editor_cache_gigahands_train \
   --output_dir runs/touch_editor_stage1_gigahands
 
-# Stage 2: fine-tune with real OpenTouch pressure.
+# Stage 2 option A: fine-tune with real OpenTouch pressure and OpenTouch-derived targets.
 python scripts/train_touch_editor.py \
   --cache_root runs/touch_editor_cache \
   --output_dir runs/touch_editor_stage2_opentouch \
   --init_checkpoint runs/touch_editor_stage1_gigahands/latest.pt
 ```
+
+If the action supervision should always be official GigaHands GT, build pseudo-paired
+OpenTouch-to-GigaHands samples instead. In this cache, OpenTouch supplies only the
+tactile input and the target is a matched official GigaHands action chunk:
+
+```bash
+python scripts/build_opentouch_gigahands_pseudo_pairs.py \
+  --checkpoint LeoJiangOR/vitra-gigahands-keypoints-step140000 \
+  --opentouch_dataset_root datasets/vitra_opentouch_keypoint \
+  --opentouch_data_mix opentouch_keypoint_train \
+  --gigahands_dataset_root datasets/vitra_gigahands_real_full_keypoints_brics001_cam0_linked \
+  --gigahands_data_mix gigahands_real_train \
+  --gigahands_statistics_dataset_name gigahands_real_train \
+  --cache_root runs/touch_editor_cache_opentouch_gigahands_matched \
+  --candidate_pool_size 4096 \
+  --random_edit_start
+
+python scripts/train_touch_editor.py \
+  --cache_root runs/touch_editor_cache_opentouch_gigahands_matched \
+  --output_dir runs/touch_editor_stage2_opentouch_gigahands_matched \
+  --init_checkpoint runs/touch_editor_stage1_gigahands/latest.pt
+```
+
+The pseudo-paired cache writes `target_source=gigahands_matched`, keeps
+`touch_source=opentouch`, and sets `residual_target = A_gigahands_gt - A_base`.
+Matching uses contact verb overlap when available, then normalized trajectory phase
+and current-state/keypoint distance. The converted OpenTouch action target is not
+used as Stage 2 supervision in this path.
 
 The cache stores both `a_target` and `residual_target = a_target - a_base`. Training minimizes the explicit residual loss on the editable future suffix:
 

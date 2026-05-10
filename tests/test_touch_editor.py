@@ -10,7 +10,29 @@ from vitra.touch_editor.model import ResidualTouchEditor
 from vitra.touch_editor.cache_utils import build_future_mask, chunk_phase
 from vitra.touch_editor.guidance import apply_touch_editor_once, apply_touch_guidance_schedule, seconds_to_chunk_index
 from vitra.touch_editor.alignment import align_touch_to_timestamps, nearest_timestamp_indices
+from vitra.touch_editor.pseudo_pair import (
+    MatchFeature,
+    MatchResult,
+    extract_contact_verbs,
+    find_best_match,
+    intersect_action_masks,
+)
 from scripts.cache_touch_editor_base_actions import build_cache_record, resolve_checkpoint_and_config
+from scripts.build_opentouch_gigahands_pseudo_pairs import replace_target_with_gigahands_match
+from scripts.evaluate_touch_guided_actions import (
+    add_delta_stats,
+    add_hand_mse,
+    filter_batch_by_paths,
+    finalize_metrics,
+    high_contact_path_set,
+    randomize_targets_from_batch,
+    shuffle_touch,
+    touch_contact_score,
+)
+from scripts.evaluate_touch_guided_actions import parse_args as parse_eval_args
+from scripts.expand_touch_editor_samples import assert_design1_record, expand_record
+from scripts.summarize_touch_ablation_metrics import gain
+from scripts.train_touch_editor import apply_touch_training_ablation
 
 
 def write_cache_sample(path: Path, chunk_len: int = 16, edit_start_idx: int = 8) -> None:
@@ -33,6 +55,8 @@ def write_cache_sample(path: Path, chunk_len: int = 16, edit_start_idx: int = 8)
         future_mask=future_mask,
         edit_start_idx=np.asarray(edit_start_idx, dtype=np.int64),
         chunk_phase=chunk_phase(chunk_len),
+        target_source=np.asarray("opentouch_derived"),
+        touch_source=np.asarray("opentouch"),
     )
 
 
@@ -112,6 +136,7 @@ def test_build_cache_record_schema():
         }
     }
     record = build_cache_record(a_base=a_base, sample=sample, episode=episode, frame_id=4, edit_start_idx=10)
+    assert np.allclose(record["a_target"], sample["action_list"])
     assert record["a_target"].shape == (16, 192)
     assert np.allclose(record["residual_target"], record["a_target"] - record["a_base"])
     assert record["touch_pressure"].shape == (16, 2, 16, 16)
@@ -121,6 +146,11 @@ def test_build_cache_record_schema():
     assert record["touch_alignment_valid"].all()
     assert record["future_mask"][:10].sum() == 0
     assert record["future_mask"][10:].all()
+    assert str(record["target_source"]) == "opentouch_derived"
+    assert str(record["target_dataset"]) == "opentouch"
+    assert str(record["touch_source"]) == "opentouch"
+    assert "matched_gigahands_data_id" not in record
+    assert "matched_episode_id" not in record
 
 
 def test_build_cache_record_requires_touch_by_default():
@@ -168,6 +198,128 @@ def test_build_cache_record_zero_touch_for_gigahands_style_episode():
     assert record["touch_aligned_indices"].tolist() == [-1] * chunk_len
     assert not record["touch_alignment_valid"].any()
     assert np.allclose(record["residual_target"], 1.0)
+    assert str(record["target_source"]) == "opentouch_derived"
+
+
+def test_expand_design1_cache_rebuilds_future_masks_without_changing_targets(tmp_path):
+    source = tmp_path / "sample_000001.npz"
+    write_cache_sample(source, edit_start_idx=8)
+    record = dict(np.load(source, allow_pickle=False))
+
+    assert_design1_record(record, source)
+    expanded = expand_record(record, edit_start_idx=3, source_path=source)
+
+    assert np.allclose(expanded["a_base"], record["a_base"])
+    assert np.allclose(expanded["a_target"], record["a_target"])
+    assert np.allclose(expanded["touch_pressure"], record["touch_pressure"])
+    assert np.array_equal(expanded["touch_mask"], record["touch_mask"])
+    assert np.allclose(expanded["residual_target"], expanded["a_target"] - expanded["a_base"])
+    assert int(expanded["edit_start_idx"]) == 3
+    assert expanded["future_mask"][:3].sum() == 0
+    assert expanded["future_mask"][3:].all()
+    assert str(expanded["target_source"]) == "opentouch_derived"
+    assert str(expanded["touch_source"]) == "opentouch"
+
+
+def test_pseudo_pair_matcher_prefers_contact_verb_match():
+    source = MatchFeature(
+        data_id=1,
+        episode_id="opentouch",
+        frame_id=5,
+        instruction="Right hand: press the object.",
+        phase=0.5,
+        state=np.zeros((4,), dtype=np.float32),
+        state_mask=np.ones((4,), dtype=bool),
+        action_target=np.zeros((2, 3), dtype=np.float32),
+        action_mask=np.ones((2, 3), dtype=bool),
+        contact_verbs=extract_contact_verbs("press the object"),
+    )
+    verb_match = MatchFeature(
+        data_id=2,
+        episode_id="gigahands_press",
+        frame_id=5,
+        instruction="Press the button.",
+        phase=0.5,
+        state=np.ones((4,), dtype=np.float32) * 0.2,
+        state_mask=np.ones((4,), dtype=bool),
+        action_target=np.ones((2, 3), dtype=np.float32),
+        action_mask=np.ones((2, 3), dtype=bool),
+        contact_verbs=extract_contact_verbs("press the button"),
+    )
+    wrong_verb = MatchFeature(
+        data_id=3,
+        episode_id="gigahands_lift",
+        frame_id=5,
+        instruction="Lift the object.",
+        phase=0.5,
+        state=np.zeros((4,), dtype=np.float32),
+        state_mask=np.ones((4,), dtype=bool),
+        action_target=np.ones((2, 3), dtype=np.float32) * 2,
+        action_mask=np.ones((2, 3), dtype=bool),
+        contact_verbs=extract_contact_verbs("lift the object"),
+    )
+
+    result = find_best_match(source, [wrong_verb, verb_match], w_task=3.0, w_phase=1.0, w_state=1.0)
+
+    assert result.index == 1
+    assert result.task_cost == 0.0
+
+
+def test_pseudo_pair_target_replacement_uses_gigahands_gt_and_intersection_mask():
+    record = {
+        "a_base": np.zeros((2, 4), dtype=np.float32),
+        "a_target": np.ones((2, 4), dtype=np.float32) * 9,
+        "residual_target": np.ones((2, 4), dtype=np.float32) * 9,
+        "action_mask": np.array([[True, True, False, False], [True, True, True, False]]),
+        "future_mask": np.ones((2, 4), dtype=np.float32),
+        "edit_start_idx": np.asarray(1, dtype=np.int64),
+    }
+    matched = MatchFeature(
+        data_id=42,
+        episode_id="gigahands",
+        frame_id=7,
+        instruction="Right hand: hold the cup.",
+        phase=0.25,
+        state=np.zeros((4,), dtype=np.float32),
+        state_mask=np.ones((4,), dtype=bool),
+        action_target=np.ones((2, 4), dtype=np.float32) * 3,
+        action_mask=np.array([[True, False, True, False], [True, True, False, False]]),
+        contact_verbs=("hold",),
+    )
+    source = MatchFeature(
+        data_id=5,
+        episode_id="opentouch_episode",
+        frame_id=3,
+        instruction="Right hand: hold the block.",
+        phase=0.2,
+        state=np.zeros((4,), dtype=np.float32),
+        state_mask=np.ones((4,), dtype=bool),
+        action_target=np.zeros((2, 4), dtype=np.float32),
+        action_mask=np.ones((2, 4), dtype=bool),
+        contact_verbs=("hold",),
+    )
+    match = MatchResult(index=0, score=0.25, task_cost=0.0, phase_cost=0.1, state_cost=0.15)
+
+    replaced = replace_target_with_gigahands_match(record, matched=matched, source=source, match=match)
+
+    assert np.allclose(replaced["a_target"], 3.0)
+    assert np.allclose(replaced["residual_target"], replaced["a_target"] - replaced["a_base"])
+    assert replaced["action_mask"].tolist() == [[True, False, False, False], [True, True, False, False]]
+    assert replaced["future_mask"][0].sum() == 0
+    assert replaced["future_mask"][1].tolist() == [1.0, 1.0, 0.0, 0.0]
+    assert str(replaced["target_source"]) == "gigahands_matched"
+    assert str(replaced["touch_source"]) == "opentouch"
+    assert str(replaced["source_episode_id"]) == "opentouch_episode"
+    assert str(replaced["matched_episode_id"]) == "gigahands"
+    assert float(replaced["source_phase"]) == pytest.approx(0.2)
+    assert float(replaced["matched_phase"]) == pytest.approx(0.25)
+    assert int(replaced["matched_gigahands_data_id"]) == 42
+    assert float(replaced["match_score"]) == pytest.approx(0.25)
+
+
+def test_intersect_action_masks_requires_same_shape():
+    with pytest.raises(ValueError, match="action mask shape mismatch"):
+        intersect_action_masks(np.ones((2, 3), dtype=bool), np.ones((2, 4), dtype=bool))
 
 
 def test_residual_loss_matches_action_demo_loss_under_editable_mask():
@@ -249,6 +401,118 @@ def test_seconds_to_chunk_index_uses_fps_and_clamps():
     assert seconds_to_chunk_index(0.33, fps=8, chunk_len=16) == 3
     assert seconds_to_chunk_index(0.66, fps=8, chunk_len=16) == 5
     assert seconds_to_chunk_index(100.0, fps=8, chunk_len=16) == 16
+
+
+def test_touch_eval_metrics_use_editable_mask_and_hand_splits():
+    totals = {}
+    diff = torch.zeros((1, 2, 4), dtype=torch.float32)
+    diff[..., 0] = 1.0
+    diff[..., 2] = 3.0
+    editable = torch.tensor([[[True, False, True, False], [False, False, True, False]]])
+
+    add_hand_mse(totals, "edit_1_base", diff, editable)
+    add_hand_mse(totals, "edit_1_edit", diff * 0.5, editable)
+    add_delta_stats(totals, "edit_1", diff, editable.to(torch.float32))
+    totals["edit_1_valid_editable_dims"] = float(editable.sum())
+
+    metrics = finalize_metrics(totals, edit_count=1)
+
+    assert metrics["edit_1_base_mse"] == pytest.approx((1.0 + 9.0 + 9.0) / 3.0)
+    assert metrics["edit_1_edit_mse"] == pytest.approx(metrics["edit_1_base_mse"] * 0.25)
+    assert metrics["edit_1_improvement_pct"] == pytest.approx(75.0)
+    assert metrics["edit_1_left_base_mse"] == pytest.approx(1.0)
+    assert metrics["edit_1_right_base_mse"] == pytest.approx(9.0)
+    assert metrics["edit_1_valid_editable_dims"] == 3.0
+
+
+def test_touch_eval_ablation_helpers_shuffle_touch_and_targets():
+    batch = {
+        "touch_pressure": torch.arange(2 * 3 * 2 * 16 * 16, dtype=torch.float32).reshape(2, 3, 2, 16, 16),
+        "touch_mask": torch.tensor([[[True, False], [True, False], [True, False]], [[False, True], [False, True], [False, True]]]),
+        "a_target": torch.tensor([[[1.0, 2.0]], [[3.0, 4.0]]]),
+        "action_mask": torch.tensor([[[True, False]], [[False, True]]]),
+    }
+
+    shuffled_pressure, shuffled_mask = shuffle_touch(batch)
+    assert torch.allclose(shuffled_pressure[0], batch["touch_pressure"][1])
+    assert torch.equal(shuffled_mask[0], batch["touch_mask"][1])
+
+    randomize_targets_from_batch(batch)
+    assert torch.allclose(batch["a_target"][0], torch.tensor([[3.0, 4.0]]))
+    assert torch.equal(batch["action_mask"][0], torch.tensor([[False, True]]))
+
+
+@pytest.mark.parametrize("ablation", ["matched", "zero_touch", "shuffled_touch", "no_touch"])
+def test_touch_eval_accepts_design1_ablation_modes(monkeypatch, ablation):
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "evaluate_touch_guided_actions.py",
+            "--cache_root",
+            "cache",
+            "--touch_editor_checkpoint",
+            "editor.pt",
+            "--ablation",
+            ablation,
+        ],
+    )
+
+    args = parse_eval_args()
+
+    assert args.ablation == ablation
+
+
+def test_no_touch_training_ablation_zeroes_pressure_and_mask():
+    pressure = torch.ones((2, 3, 2, 16, 16), dtype=torch.float32)
+    mask = torch.ones((2, 3, 2), dtype=torch.bool)
+
+    ablated_pressure, ablated_mask = apply_touch_training_ablation(pressure, mask, "zero_touch")
+    kept_pressure, kept_mask = apply_touch_training_ablation(pressure, mask, "none")
+
+    assert torch.count_nonzero(ablated_pressure) == 0
+    assert not ablated_mask.any()
+    assert torch.equal(kept_pressure, pressure)
+    assert torch.equal(kept_mask, mask)
+
+
+def test_high_contact_subset_uses_top_quartile_touch_pressure(tmp_path):
+    for idx, value in enumerate([1.0, 2.0, 3.0, 4.0]):
+        path = tmp_path / f"sample_{idx:08d}.npz"
+        write_cache_sample(path)
+        payload = dict(np.load(path, allow_pickle=False))
+        payload["touch_pressure"] = np.full((16, 2, 16, 16), value, dtype=np.float32)
+        payload["touch_mask"] = np.ones((16, 2), dtype=bool)
+        np.savez(path, **payload)
+
+    ds = TouchEditorCacheDataset(tmp_path)
+    selected, threshold = high_contact_path_set(ds, quantile=0.75)
+
+    assert threshold == pytest.approx(3.25)
+    assert len(selected) == 1
+    assert next(iter(selected)).endswith("sample_00000003.npz")
+    assert touch_contact_score(ds[3]["touch_pressure"], ds[3]["touch_mask"]) == pytest.approx(4.0)
+
+
+def test_filter_batch_by_paths_keeps_selected_samples():
+    batch = {
+        "path": ["a.npz", "b.npz"],
+        "a_base": torch.arange(4, dtype=torch.float32).reshape(2, 2),
+        "scalar": torch.tensor(1.0),
+    }
+
+    filtered = filter_batch_by_paths(batch, {"b.npz"})
+
+    assert filtered is not None
+    assert filtered["path"] == ["b.npz"]
+    assert torch.equal(filtered["a_base"], torch.tensor([[2.0, 3.0]]))
+    assert torch.equal(filtered["scalar"], torch.tensor(1.0))
+
+
+def test_touch_specific_gain_positive_when_matched_beats_baseline():
+    abs_gain, pct_gain = gain(matched=0.2, baseline=0.5)
+
+    assert abs_gain == pytest.approx(0.3)
+    assert pct_gain == pytest.approx(60.0)
 
 
 class ConstantDeltaEditor(torch.nn.Module):
