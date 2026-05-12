@@ -189,8 +189,21 @@ def discover_clips(
         with h5py.File(h5_path, "r") as handle:
             for group_path, group in iter_clip_groups(handle):
                 clip_key = Path(group_path).name
-                payload = label_payloads.get(clip_key) or label_payloads.get(group_path) or label_payloads.get(h5_path.stem) or {}
-                instruction = payload.get("instruction") or labels.get(clip_key) or labels.get(group_path) or labels.get(h5_path.stem)
+                session_clip_key = f"{h5_path.stem}::{clip_key}"
+                payload = (
+                    label_payloads.get(session_clip_key)
+                    or label_payloads.get(clip_key)
+                    or label_payloads.get(group_path)
+                    or label_payloads.get(h5_path.stem)
+                    or {}
+                )
+                instruction = (
+                    payload.get("instruction")
+                    or labels.get(session_clip_key)
+                    or labels.get(clip_key)
+                    or labels.get(group_path)
+                    or labels.get(h5_path.stem)
+                )
                 matched_keyword = payload.get("matched_keyword", "")
                 if filter_contact_keywords and not matched_keyword:
                     continue

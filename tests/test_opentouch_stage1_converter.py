@@ -152,6 +152,33 @@ def test_opentouch_conversion_preserves_both_hand_touch_and_manifest(tmp_path):
     assert epi["opentouch"]["touch_mask"].all()
 
 
+def test_opentouch_conversion_matches_session_scoped_clip_labels(tmp_path):
+    converter = load_converter()
+    input_root = tmp_path / "opentouch_raw"
+    output_root = tmp_path / "vitra_opentouch_keypoint"
+    write_opentouch_fixture(input_root, clip_id="demo_00")
+    labels = input_root / "labels.csv"
+    labels.write_text(
+        "clip_id,description,action\n"
+        "synthetic_session::demo_00,Slide the right thumb across the sensor.,slide\n",
+        encoding="utf-8",
+    )
+
+    report = converter.convert_opentouch_to_vitra_stage1(
+        opentouch_root=input_root,
+        output_root=output_root,
+        labels_path=labels,
+        min_frames=17,
+        train_ratio=1.0,
+        write_video=False,
+    )
+
+    assert report["num_episodes_written"] == 1
+    episode_path = next((output_root / "Annotation" / "opentouch_keypoint_train" / "episodic_annotations").glob("*.npy"))
+    epi = np.load(episode_path, allow_pickle=True).item()
+    assert epi["text"]["right"][0][0] == "Slide the right thumb across the sensor."
+
+
 def test_opentouch_contact_filter_skips_nonmatching_labels(tmp_path):
     converter = load_converter()
     input_root = tmp_path / "opentouch_raw"

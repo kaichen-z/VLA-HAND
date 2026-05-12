@@ -163,6 +163,8 @@ cython_debug/
 .worktrees/
 
 *cache*
+!scripts/cache_touch_editor_base_actions.py
+!vitra/touch_editor/cache_utils.py
 .idea/
 # **/*.png
 **/*.pkl
