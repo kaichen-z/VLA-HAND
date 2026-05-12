@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -33,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda_delta", type=float, default=0.01)
     parser.add_argument("--lambda_smooth", type=float, default=0.05)
     parser.add_argument("--lambda_mask", type=float, default=1.0)
+    parser.add_argument("--contact_subset", choices=("all", "high_contact"), default="all")
+    parser.add_argument("--high_contact_quantile", type=float, default=0.75)
     parser.add_argument(
         "--touch_ablation",
         choices=("none", "zero_touch"),
@@ -40,6 +43,31 @@ def parse_args() -> argparse.Namespace:
         help="Optionally ablate tactile input during training. Use zero_touch for a no-touch editor.",
     )
     return parser.parse_args()
+
+
+def _score_cache_path(path: Path) -> float:
+    with np.load(path, allow_pickle=False) as payload:
+        contact_score = float(np.asarray(payload.get("observed_touch_contact_score", 0.0)).item())
+        contact_delta = float(np.asarray(payload.get("observed_touch_contact_delta", 0.0)).item())
+    return max(contact_score, contact_delta)
+
+
+def filter_dataset_by_observed_contact(
+    dataset: TouchEditorCacheDataset,
+    *,
+    quantile: float,
+) -> TouchEditorCacheDataset:
+    if not 0.0 <= float(quantile) <= 1.0:
+        raise ValueError("quantile must be between 0 and 1")
+    scored_paths = [(path, _score_cache_path(Path(path))) for path in dataset.paths]
+    if not scored_paths:
+        return dataset
+    threshold = torch.quantile(torch.tensor([score for _, score in scored_paths], dtype=torch.float32), float(quantile)).item()
+    filtered_paths = [path for path, score in scored_paths if score >= threshold]
+    filtered = object.__new__(TouchEditorCacheDataset)
+    filtered.cache_root = dataset.cache_root
+    filtered.paths = filtered_paths
+    return filtered
 
 
 def serializable_args(args: argparse.Namespace) -> dict[str, object]:
@@ -59,10 +87,51 @@ def apply_touch_training_ablation(
     return touch_pressure, touch_mask
 
 
+def causal_touch_history_from_batch(
+    touch_pressure: torch.Tensor,
+    touch_mask: torch.Tensor,
+    edit_start_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep only touch observations available at each sample's edit time.
+
+    ``edit_start_idx`` is inclusive: editing at index 3 may use tactile
+    observations from indices 0, 1, 2, and 3, but never indices 4+.
+    """
+    if touch_pressure.ndim != 5:
+        raise ValueError(f"touch_pressure must be [B,T,2,16,16], got {tuple(touch_pressure.shape)}")
+    if touch_mask.ndim != 3:
+        raise ValueError(f"touch_mask must be [B,T,2], got {tuple(touch_mask.shape)}")
+    if touch_pressure.shape[:2] != touch_mask.shape[:2]:
+        raise ValueError("touch_pressure and touch_mask batch/time dimensions must match")
+    if touch_pressure.shape[0] == 0:
+        return touch_pressure, touch_mask
+
+    edit_start_idx = torch.as_tensor(edit_start_idx, device=touch_pressure.device, dtype=torch.long).reshape(-1)
+    if edit_start_idx.numel() == 1 and touch_pressure.shape[0] > 1:
+        edit_start_idx = edit_start_idx.expand(touch_pressure.shape[0])
+    if edit_start_idx.numel() != touch_pressure.shape[0]:
+        raise ValueError(
+            f"edit_start_idx must have batch size {touch_pressure.shape[0]}, got {edit_start_idx.numel()}"
+        )
+
+    max_time = int(touch_pressure.shape[1])
+    observed_lens = (edit_start_idx.clamp(min=0, max=max_time - 1) + 1).clamp(min=1, max=max_time)
+    max_observed_len = int(observed_lens.max().item())
+    history = touch_pressure[:, :max_observed_len].clone()
+    history_mask = touch_mask[:, :max_observed_len].clone()
+    time = torch.arange(max_observed_len, device=touch_pressure.device)[None, :]
+    valid_history = time < observed_lens[:, None]
+    history = history * valid_history[:, :, None, None, None].to(history.dtype)
+    history_mask = history_mask & valid_history[:, :, None]
+    return history, history_mask
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset = TouchEditorCacheDataset(args.cache_root)
+    if args.contact_subset == "high_contact":
+        dataset = filter_dataset_by_observed_contact(dataset, quantile=args.high_contact_quantile)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
     model = ResidualTouchEditor().to(args.device)
     if args.init_checkpoint is not None:
@@ -82,6 +151,11 @@ def main() -> None:
                     batch["touch_pressure"],
                     batch["touch_mask"],
                     args.touch_ablation,
+                )
+                touch_pressure, touch_mask = causal_touch_history_from_batch(
+                    touch_pressure,
+                    touch_mask,
+                    batch["edit_start_idx"],
                 )
                 delta = model(
                     batch["a_base"],

@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,9 +18,10 @@ from vitra.touch_editor.pseudo_pair import (
     find_best_match,
     intersect_action_masks,
 )
-from scripts.cache_touch_editor_base_actions import build_cache_record, resolve_checkpoint_and_config
+from scripts.cache_touch_editor_base_actions import build_cache_record, resolve_checkpoint_and_config, select_data_ids
 from scripts.build_opentouch_gigahands_pseudo_pairs import replace_target_with_gigahands_match
 from scripts.evaluate_touch_guided_actions import (
+    add_prefix_change_stats,
     add_delta_stats,
     add_hand_mse,
     filter_batch_by_paths,
@@ -32,7 +34,11 @@ from scripts.evaluate_touch_guided_actions import (
 from scripts.evaluate_touch_guided_actions import parse_args as parse_eval_args
 from scripts.expand_touch_editor_samples import assert_design1_record, expand_record
 from scripts.summarize_touch_ablation_metrics import gain
-from scripts.train_touch_editor import apply_touch_training_ablation
+from scripts.train_touch_editor import (
+    apply_touch_training_ablation,
+    causal_touch_history_from_batch,
+    filter_dataset_by_observed_contact,
+)
 
 
 def write_cache_sample(path: Path, chunk_len: int = 16, edit_start_idx: int = 8) -> None:
@@ -146,6 +152,9 @@ def test_build_cache_record_schema():
     assert record["touch_alignment_valid"].all()
     assert record["future_mask"][:10].sum() == 0
     assert record["future_mask"][10:].all()
+    assert int(record["observed_touch_len"]) == 11
+    assert np.isclose(float(record["observed_touch_contact_score"]), 9.0)
+    assert np.isclose(float(record["observed_touch_contact_delta"]), 10.0)
     assert str(record["target_source"]) == "opentouch_derived"
     assert str(record["target_dataset"]) == "opentouch"
     assert str(record["touch_source"]) == "opentouch"
@@ -201,6 +210,41 @@ def test_build_cache_record_zero_touch_for_gigahands_style_episode():
     assert str(record["target_source"]) == "opentouch_derived"
 
 
+def test_select_data_ids_supports_reproducible_random_sampling():
+    sequential = select_data_ids(dataset_len=20, start_index=4, max_samples=5, sample_mode="sequential", seed=7)
+    first = select_data_ids(dataset_len=20, start_index=4, max_samples=5, sample_mode="random", seed=7)
+    second = select_data_ids(dataset_len=20, start_index=4, max_samples=5, sample_mode="random", seed=7)
+
+    assert sequential == [4, 5, 6, 7, 8]
+    assert first == second
+    assert len(first) == 5
+    assert len(set(first)) == 5
+    assert min(first) >= 4
+    assert first != sequential
+
+
+def test_get_episode_and_frame_supports_index_frame_pair_core():
+    from scripts.cache_touch_editor_base_actions import get_episode_and_frame
+
+    episode = {"opentouch": {"touch_pressure": np.zeros((4, 2, 16, 16), dtype=np.float32)}}
+
+    class FakeCore:
+        index_frame_pair = np.asarray([[0, 3], [0, 4]], dtype=np.int64)
+        index_to_episode_id = np.asarray(["episode_a"])
+
+        def _load_or_cache_episode(self, episode_id):
+            assert episode_id == "episode_a"
+            return episode, None, None
+
+    dataset = SimpleNamespace(episodic_dataset_core=FakeCore())
+
+    loaded, frame_id, episode_id = get_episode_and_frame(dataset, 1)
+
+    assert loaded is episode
+    assert frame_id == 4
+    assert episode_id == "episode_a"
+
+
 def test_expand_design1_cache_rebuilds_future_masks_without_changing_targets(tmp_path):
     source = tmp_path / "sample_000001.npz"
     write_cache_sample(source, edit_start_idx=8)
@@ -215,6 +259,9 @@ def test_expand_design1_cache_rebuilds_future_masks_without_changing_targets(tmp
     assert np.array_equal(expanded["touch_mask"], record["touch_mask"])
     assert np.allclose(expanded["residual_target"], expanded["a_target"] - expanded["a_base"])
     assert int(expanded["edit_start_idx"]) == 3
+    assert int(expanded["observed_touch_len"]) == 4
+    assert np.isclose(float(expanded["observed_touch_contact_score"]), 1.0)
+    assert np.isclose(float(expanded["observed_touch_contact_delta"]), 0.0)
     assert expanded["future_mask"][:3].sum() == 0
     assert expanded["future_mask"][3:].all()
     assert str(expanded["target_source"]) == "opentouch_derived"
@@ -333,6 +380,23 @@ def test_residual_loss_matches_action_demo_loss_under_editable_mask():
     losses = touch_editor_loss(a_base, a_target, delta, action_mask, future_mask)
 
     assert torch.allclose(losses["loss_residual"], losses["loss_demo"])
+
+
+def test_add_prefix_change_stats_measures_executed_prefix_only():
+    totals = {}
+    a_base = torch.zeros((1, 4, 3), dtype=torch.float32)
+    a_edit = torch.zeros((1, 4, 3), dtype=torch.float32)
+    a_edit[:, 0] = 2.0
+    a_edit[:, 1] = 1.0
+    a_edit[:, 2:] = 100.0
+    future_mask = torch.zeros((1, 4, 3), dtype=torch.float32)
+    future_mask[:, 2:] = 1.0
+    action_mask = torch.ones((1, 4, 3), dtype=torch.bool)
+
+    add_prefix_change_stats(totals, "edit_1", a_edit, a_base, future_mask, action_mask)
+
+    assert totals["edit_1_prefix_change_l2_sum"] == pytest.approx(3.0**0.5 * 2.0 + 3.0**0.5)
+    assert totals["edit_1_prefix_change_l2_count"] == 2.0
 
 
 def test_nearest_timestamp_indices_exact_nearest_and_tolerance():
@@ -533,6 +597,104 @@ class ConstantDeltaEditor(torch.nn.Module):
         action_mask,
     ):
         return torch.ones_like(a_base) * self.value
+
+
+class TouchShapeRecorder(ConstantDeltaEditor):
+    def __init__(self):
+        super().__init__(0.0)
+        self.touch_shapes = []
+        self.touch_sums = []
+
+    def forward(
+        self,
+        a_base,
+        current_state,
+        current_state_mask,
+        touch_pressure,
+        touch_mask,
+        chunk_phase,
+        future_mask,
+        action_mask,
+    ):
+        self.touch_shapes.append(tuple(touch_pressure.shape))
+        self.touch_sums.append(float(touch_pressure.sum().detach().cpu()))
+        return torch.zeros_like(a_base)
+
+
+def test_training_causal_touch_history_removes_future_touch():
+    touch_pressure = torch.zeros((2, 16, 2, 16, 16), dtype=torch.float32)
+    touch_pressure[:, :, :, :, :] = torch.arange(16, dtype=torch.float32)[None, :, None, None, None]
+    touch_mask = torch.ones((2, 16, 2), dtype=torch.bool)
+    edit_start_idx = torch.tensor([1, 3], dtype=torch.long)
+
+    history, history_mask = causal_touch_history_from_batch(touch_pressure, touch_mask, edit_start_idx)
+
+    assert history.shape == (2, 4, 2, 16, 16)
+    assert history_mask.shape == (2, 4, 2)
+    assert torch.allclose(history[0, 0], torch.zeros_like(history[0, 0]))
+    assert torch.allclose(history[0, 1], torch.ones_like(history[0, 1]))
+    assert torch.allclose(history[0, 2:], torch.zeros_like(history[0, 2:]))
+    assert history_mask[0, :2].all()
+    assert not history_mask[0, 2:].any()
+    assert torch.allclose(history[1, 3], torch.full_like(history[1, 3], 3.0))
+    assert history_mask[1, :4].all()
+
+
+def test_filter_dataset_by_observed_contact_keeps_high_signal_samples(tmp_path):
+    for idx, score in enumerate([0.1, 0.8, 0.3, 1.2]):
+        path = tmp_path / f"sample_{idx}.npz"
+        write_cache_sample(path)
+        with np.load(path, allow_pickle=False) as payload:
+            record = {key: payload[key] for key in payload.files}
+        record["observed_touch_contact_score"] = np.asarray(score, dtype=np.float32)
+        record["observed_touch_contact_delta"] = np.asarray(0.0, dtype=np.float32)
+        np.savez(path, **record)
+    dataset = TouchEditorCacheDataset(tmp_path)
+
+    filtered = filter_dataset_by_observed_contact(dataset, quantile=0.5)
+
+    kept = [Path(path).name for path in filtered.paths]
+    assert kept == ["sample_1.npz", "sample_3.npz"]
+
+
+def test_apply_touch_editor_once_passes_only_observed_touch_history():
+    editor = TouchShapeRecorder()
+    touch_pressure = torch.zeros((1, 16, 2, 16, 16), dtype=torch.float32)
+    touch_pressure[:, :4] = 1.0
+    touch_pressure[:, 4:] = 100.0
+
+    apply_touch_editor_once(
+        editor=editor,
+        a_base=torch.zeros((1, 16, 192), dtype=torch.float32),
+        current_state=torch.zeros((1, 212), dtype=torch.float32),
+        current_state_mask=torch.ones((1, 212), dtype=torch.bool),
+        touch_pressure=touch_pressure,
+        touch_mask=torch.ones((1, 16, 2), dtype=torch.bool),
+        action_mask=torch.ones((1, 16, 192), dtype=torch.bool),
+        edit_start_idx=3,
+    )
+
+    assert editor.touch_shapes == [(1, 4, 2, 16, 16)]
+    assert editor.touch_sums == [float(4 * 2 * 16 * 16)]
+
+
+def test_apply_touch_editor_once_can_run_future_touch_oracle():
+    editor = TouchShapeRecorder()
+    touch_pressure = torch.ones((1, 16, 2, 16, 16), dtype=torch.float32)
+
+    apply_touch_editor_once(
+        editor=editor,
+        a_base=torch.zeros((1, 16, 192), dtype=torch.float32),
+        current_state=torch.zeros((1, 212), dtype=torch.float32),
+        current_state_mask=torch.ones((1, 212), dtype=torch.bool),
+        touch_pressure=touch_pressure,
+        touch_mask=torch.ones((1, 16, 2), dtype=torch.bool),
+        action_mask=torch.ones((1, 16, 192), dtype=torch.bool),
+        edit_start_idx=3,
+        use_full_touch_window=True,
+    )
+
+    assert editor.touch_shapes == [(1, 16, 2, 16, 16)]
 
 
 def test_apply_touch_editor_once_edits_only_unexecuted_future():
