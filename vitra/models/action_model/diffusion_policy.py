@@ -2,6 +2,7 @@ from vitra.models.action_model.dit import DiT
 from vitra.models.action_model import create_diffusion
 from . import gaussian_diffusion as gd
 from vitra.datasets.dataset_utils import ActionFeature
+from vitra.guidance.polynomial_guidance import CFGAwareGuidanceWrapper
 import torch
 from torch import nn
 
@@ -15,8 +16,23 @@ def DiT_B(**kwargs):
     return DiT(depth=12, hidden_size=768, num_heads=12, **kwargs)
 def DiT_L(**kwargs):
     return DiT(depth=24, hidden_size=1024, num_heads=16, **kwargs)
+def DiT_B_4L(**kwargs):
+    return DiT(depth=4, hidden_size=768, num_heads=12, **kwargs)
+def DiT_B_6L(**kwargs):
+    return DiT(depth=6, hidden_size=768, num_heads=12, **kwargs)
+def DiT_B_8L(**kwargs):
+    return DiT(depth=8, hidden_size=768, num_heads=12, **kwargs)
 
-DiT_models = {'DiT-S': DiT_S, 'DiT-M': DiT_M, 'DiT-B': DiT_B, 'DiT-T': DiT_T, 'DiT-L': DiT_L}
+DiT_models = {
+    'DiT-S': DiT_S,
+    'DiT-M': DiT_M,
+    'DiT-B': DiT_B,
+    'DiT-T': DiT_T,
+    'DiT-L': DiT_L,
+    "DiT-B-4L": DiT_B_4L,
+    "DiT-B-6L": DiT_B_6L,
+    "DiT-B-8L": DiT_B_8L,
+}
 
 class DiffusionPolicy(nn.Module):
     def __init__(
@@ -130,16 +146,33 @@ class DiffusionPolicy(nn.Module):
             use_ddim,
             num_ddim_steps,
             action_masks,
+            guidance_fn=None,
+            guidance_scale: float = 0.0,
+            guidance_start_frac: float = 0.0,
+            guidance_end_frac: float = 1.0,
+            guidance_grad_clip: float = 1.0,
+            return_guidance_trace: bool = False,
+            fixed_actions=None,
+            fixed_action_mask=None,
+            return_replan_trace: bool = False,
         ):
         B = action_features.shape[0]
         noise = torch.randn(action_features.shape[0], self.future_action_window_size+1, 
                 self.in_channels,  device=action_features.device)   #[B, T, D]
 
         x_mask = action_masks.to(action_features.device)
+        if fixed_actions is not None:
+            fixed_actions = fixed_actions.to(action_features.device, dtype=noise.dtype)
+        if fixed_action_mask is not None:
+            fixed_action_mask = fixed_action_mask.to(action_features.device, dtype=noise.dtype)
 
         using_cfg = cfg_scale > 1.0
         if using_cfg:
             noise = torch.cat([noise, noise], 0)
+            if fixed_actions is not None:
+                fixed_actions = torch.cat([fixed_actions, fixed_actions], 0)
+            if fixed_action_mask is not None:
+                fixed_action_mask = torch.cat([fixed_action_mask, fixed_action_mask], 0)
             uncondition = self.net.z_embedder.uncondition
             uncondition = uncondition.unsqueeze(0)  #[1, D]
             uncondition = uncondition.expand(B, 1, -1) #[B, 1, D]
@@ -156,25 +189,69 @@ class DiffusionPolicy(nn.Module):
                 model_kwargs = dict(z=z, x_mask=x_mask, cfg_scale=cfg_scale)
             sample_fn = self.net.forward_with_cfg
         else:
+            z = action_features
             if self.use_state == 'DiT':
                 model_kwargs = dict(z=z, x_mask=x_mask, state=current_state, state_mask=current_state_mask)
             else:
                 model_kwargs = dict(z=z, x_mask=x_mask)
             sample_fn = self.net.forward
 
+        if guidance_fn is not None:
+            guidance_fn = CFGAwareGuidanceWrapper(
+                guidance_fn,
+                original_batch_size=B,
+                using_cfg=using_cfg,
+            )
+
+        trace = None
         if use_ddim and num_ddim_steps is not None:
             if self.ddim_diffusion is None:
                 self.create_ddim(ddim_step=num_ddim_steps)
-            samples = self.ddim_diffusion.ddim_sample_loop(
-                sample_fn, 
-                noise.shape, 
-                noise, 
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-                progress=False,
-                device=action_features.device,
-                eta=0.0
-            )
+            if fixed_actions is not None or fixed_action_mask is not None:
+                samples, trace = self.ddim_diffusion.ddim_sample_loop_replanning_guided(
+                    sample_fn,
+                    noise.shape,
+                    noise,
+                    clip_denoised=False,
+                    model_kwargs=model_kwargs,
+                    progress=False,
+                    device=action_features.device,
+                    eta=0.0,
+                    fixed_xstart=fixed_actions,
+                    fixed_mask=fixed_action_mask,
+                    guidance_fn=guidance_fn,
+                    guidance_scale=guidance_scale,
+                    guidance_start_frac=guidance_start_frac,
+                    guidance_end_frac=guidance_end_frac,
+                    guidance_grad_clip=guidance_grad_clip,
+                )
+            elif guidance_fn is None:
+                samples = self.ddim_diffusion.ddim_sample_loop(
+                    sample_fn, 
+                    noise.shape, 
+                    noise, 
+                    clip_denoised=False,
+                    model_kwargs=model_kwargs,
+                    progress=False,
+                    device=action_features.device,
+                    eta=0.0
+                )
+            else:
+                samples, trace = self.ddim_diffusion.ddim_sample_loop_velocity_guided(
+                    sample_fn,
+                    noise.shape,
+                    noise,
+                    clip_denoised=False,
+                    model_kwargs=model_kwargs,
+                    progress=False,
+                    device=action_features.device,
+                    eta=0.0,
+                    guidance_fn=guidance_fn,
+                    guidance_scale=guidance_scale,
+                    guidance_start_frac=guidance_start_frac,
+                    guidance_end_frac=guidance_end_frac,
+                    guidance_grad_clip=guidance_grad_clip,
+                )
         else:
             samples = self.ddim_diffusion.diffusion.p_sample_loop(
                 sample_fn, 
@@ -187,6 +264,8 @@ class DiffusionPolicy(nn.Module):
             )
         if using_cfg:
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+        if return_guidance_trace or return_replan_trace:
+            return samples, trace
         return samples
 
     # Create DDIM sampler

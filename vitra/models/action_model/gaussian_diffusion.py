@@ -639,6 +639,294 @@ class GaussianDiffusion:
             final = sample
         return final["sample"]
 
+    def ddim_sample_loop_velocity_guided(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+        guidance_fn=None,
+        guidance_scale: float = 0.0,
+        guidance_start_frac: float = 0.0,
+        guidance_end_frac: float = 1.0,
+        guidance_grad_clip: float = 1.0,
+    ):
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        assert guidance_fn is not None
+        assert eta == 0.0, "V0 velocity guidance assumes deterministic DDIM."
+
+        img = noise if noise is not None else th.randn(*shape, device=device)
+        indices = list(range(self.num_timesteps))[::-1]
+        total = len(indices)
+        if progress:
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        trace = []
+        for step_id, i in enumerate(indices):
+            t = th.tensor([i] * shape[0], device=device)
+            frac = step_id / max(total - 1, 1)
+            guidance_active = (
+                float(guidance_scale) > 0.0
+                and frac >= float(guidance_start_frac)
+                and frac <= float(guidance_end_frac)
+            )
+            if not guidance_active:
+                with th.no_grad():
+                    out = self.ddim_sample(
+                        model,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=None,
+                        model_kwargs=model_kwargs,
+                        eta=eta,
+                    )
+                img = out["sample"]
+                trace.append({"step_id": step_id, "t": int(i), "guidance_active": False})
+                continue
+
+            with th.enable_grad():
+                x_in = img.detach().requires_grad_(True)
+                out = self.p_mean_variance(
+                    model,
+                    x_in,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    model_kwargs=model_kwargs,
+                )
+                pred_xstart = out["pred_xstart"]
+                if hasattr(guidance_fn, "gradient"):
+                    grad, loss, metrics = guidance_fn.gradient(x_in, pred_xstart)
+                else:
+                    loss, metrics = guidance_fn(pred_xstart)
+                    grad = th.autograd.grad(
+                        loss,
+                        x_in,
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=False,
+                    )[0]
+                grad = th.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+                if guidance_grad_clip is not None and guidance_grad_clip > 0:
+                    norm = grad.flatten(1).norm(dim=1).view(-1, *([1] * (grad.ndim - 1)))
+                    scale = (float(guidance_grad_clip) / (norm + 1e-6)).clamp(max=1.0)
+                    grad = grad * scale
+
+            x_base = img.detach()
+            pred_xstart_base = pred_xstart.detach()
+            cond_grad = -float(guidance_scale) * grad.detach()
+
+            alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x_base.shape)
+            alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x_base.shape)
+            eps = self._predict_eps_from_xstart(x_base, t, pred_xstart_base)
+            eps_guided = eps - (1.0 - alpha_bar).sqrt() * cond_grad
+            pred_xstart_guided = self._predict_xstart_from_eps(x_t=x_base, t=t, eps=eps_guided)
+            sigma = (
+                eta
+                * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+                * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+            )
+            noise_t = th.randn_like(x_base)
+            mean_pred = (
+                pred_xstart_guided * th.sqrt(alpha_bar_prev)
+                + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps_guided
+            )
+            nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_base.shape) - 1)))
+            sample = mean_pred + nonzero_mask * sigma * noise_t
+            img = sample.detach()
+
+            trace_item = {
+                "step_id": step_id,
+                "t": int(i),
+                "guidance_active": True,
+                "loss": float(loss.detach().cpu()),
+                "grad_norm": float(grad.detach().flatten(1).norm(dim=1).mean().cpu()),
+            }
+            for key, value in metrics.items():
+                if th.is_tensor(value):
+                    trace_item[key] = float(value.detach().float().mean().cpu())
+                else:
+                    trace_item[key] = value
+            trace.append(trace_item)
+        return img, trace
+
+    def _clamp_fixed_xstart_at_t(self, x_t, t, fixed_xstart=None, fixed_mask=None, prefix_noise=None):
+        if fixed_xstart is None or fixed_mask is None:
+            return x_t
+        fixed_xstart = fixed_xstart.to(device=x_t.device, dtype=x_t.dtype)
+        fixed_mask = fixed_mask.to(device=x_t.device, dtype=x_t.dtype)
+        if prefix_noise is None:
+            prefix_noise = th.zeros_like(fixed_xstart)
+        prefix_noise = prefix_noise.to(device=x_t.device, dtype=x_t.dtype)
+        if fixed_xstart.shape != x_t.shape:
+            raise ValueError(f"fixed_xstart shape {fixed_xstart.shape} != sample shape {x_t.shape}")
+        if fixed_mask.shape != x_t.shape:
+            raise ValueError(f"fixed_mask shape {fixed_mask.shape} != sample shape {x_t.shape}")
+        if prefix_noise.shape != x_t.shape:
+            raise ValueError(f"prefix_noise shape {prefix_noise.shape} != sample shape {x_t.shape}")
+        fixed_noisy = self.q_sample(fixed_xstart, t, noise=prefix_noise)
+        return x_t * (1.0 - fixed_mask) + fixed_noisy * fixed_mask
+
+    def ddim_sample_loop_replanning_guided(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        eta=0.0,
+        fixed_xstart=None,
+        fixed_mask=None,
+        prefix_noise=None,
+        guidance_fn=None,
+        guidance_scale: float = 0.0,
+        guidance_start_frac: float = 0.0,
+        guidance_end_frac: float = 1.0,
+        guidance_grad_clip: float = 1.0,
+    ):
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list, th.Size))
+        assert eta == 0.0, "V0 replanning guidance assumes deterministic DDIM."
+
+        img = noise if noise is not None else th.randn(*shape, device=device)
+        fixed_mask_for_grad = None
+        if fixed_xstart is not None or fixed_mask is not None:
+            if fixed_xstart is None or fixed_mask is None:
+                raise ValueError("fixed_xstart and fixed_mask must be provided together.")
+            fixed_xstart = fixed_xstart.to(device=device, dtype=img.dtype)
+            fixed_mask = fixed_mask.to(device=device, dtype=img.dtype)
+            fixed_mask_for_grad = fixed_mask
+            if prefix_noise is None:
+                prefix_noise = th.randn_like(fixed_xstart)
+            else:
+                prefix_noise = prefix_noise.to(device=device, dtype=img.dtype)
+
+        indices = list(range(self.num_timesteps))[::-1]
+        total = len(indices)
+        if progress:
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        trace = []
+        for step_id, i in enumerate(indices):
+            t = th.tensor([i] * shape[0], device=device)
+            img = self._clamp_fixed_xstart_at_t(img, t, fixed_xstart, fixed_mask, prefix_noise)
+            frac = step_id / max(total - 1, 1)
+            guidance_active = (
+                guidance_fn is not None
+                and float(guidance_scale) > 0.0
+                and frac >= float(guidance_start_frac)
+                and frac <= float(guidance_end_frac)
+            )
+            if not guidance_active:
+                with th.no_grad():
+                    out = self.ddim_sample(
+                        model,
+                        img,
+                        t,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=None,
+                        model_kwargs=model_kwargs,
+                        eta=eta,
+                    )
+                img = out["sample"]
+                trace.append({"step_id": step_id, "t": int(i), "guidance_active": False})
+                continue
+
+            with th.enable_grad():
+                x_in = img.detach().requires_grad_(True)
+                out = self.p_mean_variance(
+                    model,
+                    x_in,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    model_kwargs=model_kwargs,
+                )
+                pred_xstart = out["pred_xstart"]
+                if hasattr(guidance_fn, "gradient"):
+                    grad, loss, metrics = guidance_fn.gradient(x_in, pred_xstart)
+                else:
+                    loss, metrics = guidance_fn(pred_xstart)
+                    grad = th.autograd.grad(
+                        loss,
+                        x_in,
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=False,
+                    )[0]
+                grad = th.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+                fixed_grad_abs_max = 0.0
+                if fixed_mask_for_grad is not None:
+                    fixed_grad_abs_max = float((grad.detach() * fixed_mask_for_grad).abs().max().cpu())
+                    grad = grad * (1.0 - fixed_mask_for_grad)
+                if guidance_grad_clip is not None and guidance_grad_clip > 0:
+                    norm = grad.flatten(1).norm(dim=1).view(-1, *([1] * (grad.ndim - 1)))
+                    scale = (float(guidance_grad_clip) / (norm + 1e-6)).clamp(max=1.0)
+                    grad = grad * scale
+
+            x_base = img.detach()
+            pred_xstart_base = pred_xstart.detach()
+            cond_grad = -float(guidance_scale) * grad.detach()
+
+            alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x_base.shape)
+            alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x_base.shape)
+            eps = self._predict_eps_from_xstart(x_base, t, pred_xstart_base)
+            eps_guided = eps - (1.0 - alpha_bar).sqrt() * cond_grad
+            pred_xstart_guided = self._predict_xstart_from_eps(x_t=x_base, t=t, eps=eps_guided)
+            sigma = (
+                eta
+                * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+                * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+            )
+            noise_t = th.randn_like(x_base)
+            mean_pred = (
+                pred_xstart_guided * th.sqrt(alpha_bar_prev)
+                + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps_guided
+            )
+            nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x_base.shape) - 1)))
+            sample = mean_pred + nonzero_mask * sigma * noise_t
+            img = sample.detach()
+
+            trace_item = {
+                "step_id": step_id,
+                "t": int(i),
+                "guidance_active": True,
+                "loss": float(loss.detach().cpu()),
+                "grad_norm": float(grad.detach().flatten(1).norm(dim=1).mean().cpu()),
+                "fixed_grad_abs_max": fixed_grad_abs_max,
+            }
+            for key, value in metrics.items():
+                if th.is_tensor(value):
+                    trace_item[key] = float(value.detach().float().mean().cpu())
+                else:
+                    trace_item[key] = value
+            trace.append(trace_item)
+
+        if fixed_xstart is not None and fixed_mask is not None:
+            img = img * (1.0 - fixed_mask) + fixed_xstart * fixed_mask
+            fixed_error = ((img - fixed_xstart).abs() * fixed_mask).max()
+            if trace:
+                trace[-1]["fixed_prefix_error_max"] = float(fixed_error.detach().cpu())
+        return img, trace
+
     def ddim_sample_loop_progressive(
         self,
         model,

@@ -1,0 +1,59 @@
+{
+    "parent": "vitra/configs/finetune_distill_all_cam0_keypoints_mano.json",
+    "vla_name": "VITRA_EncoderStudent",
+    "task_name": "finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano",
+    "output_root": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano/checkpoints",
+    "log_root": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano/logs",
+    "cache_root": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano/cache",
+    "teacher_config": "vitra/configs/human_pretrain_gigahands_real_all_cam0_keypoints_mano_vitra3b_linked.json",
+    "teacher_checkpoint": "runs/gigahands_real_all_cam0_keypoints_mano_vitra3b_linked_train/checkpoints/gigahands_real_all_cam0_keypoints_mano_vitra3b_linked_stage1_TB2_B2_bf16True/checkpoints/epoch=0-step=140000.ckpt",
+    "student_init_checkpoint": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano/init_student/weights.pt",
+    "feature_loss_weight": 1.0,
+    "action_loss_weight": 1.0,
+    "action_kd_loss_weight": 1.0,
+    "action_model": {
+        "model_type": "DiT-B-6L",
+        "token_size": 2304,
+        "action_dim": 192,
+        "hidden_size": 768
+    },
+    "train_dataset": {
+        "data_root_dir": "datasets/vitra_gigahands_real_all_cam0_keypoints_mano_linked_cleaned",
+        "augmentation": false,
+        "set_none_ratio": 0.0,
+        "data_mix": "gigahands_real_train",
+        "num_workers": 4,
+        "prefetch_factor": null,
+        "flip_augmentation": 1.0,
+        "action_type": "keypoints",
+        "use_rel": false,
+        "clip_len": null,
+        "normalization": true,
+        "state_mask_prob": 0.0,
+        "statistics_dataset_name": "gigahands_real_train",
+        "target_image_height": 224
+    },
+    "eval_dataset": {
+        "data_root_dir": "datasets/vitra_gigahands_real_all_cam0_keypoints_mano_linked_cleaned",
+        "data_mix": "gigahands_real_test",
+        "num_eval_clips": 1495,
+        "eval_sample_strategy": "middle_per_episode"
+    },
+    "batch_size": 2,
+    "total_batch_size": 4,
+    "save_steps": 50000,
+    "max_saved_checkpoints": 1,
+    "trainer": {
+        "max_steps": 50000
+    },
+    "training": {
+        "batch_size_per_gpu": 2,
+        "grad_accum_steps": 2,
+        "max_train_samples": 0,
+        "log_every": 50,
+        "lr": 1e-5,
+        "weight_decay": 0.1,
+        "grad_clip": 1.0
+    },
+    "repeated_diffusion_steps": 4
+}

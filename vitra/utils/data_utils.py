@@ -257,6 +257,12 @@ class PaddedCollatorForHandPrediction:
 
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
+
+        if "raw_image" in instances[0]:
+            output["raw_images"] = [instance["raw_image"] for instance in instances]
+
+        if "instruction" in instances[0]:
+            output["instructions"] = [instance["instruction"] for instance in instances]
     
         return output
 

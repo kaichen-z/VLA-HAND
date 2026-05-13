@@ -152,7 +152,9 @@ class FrameDataset(Dataset):
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         img = data["image_list"][-1]
         img = Image.fromarray(img)
-        lang = data["instruction"]
+        raw_image = img.copy()
+        raw_instruction = data["instruction"]
+        lang = raw_instruction
         imgs = []
         imgs.append(img)
         # can be modified to multiple images
@@ -184,6 +186,8 @@ class FrameDataset(Dataset):
             current_state=data["current_state"],
             fov = fov,
             intrinsics = intrinsics,
+            raw_image=raw_image,
+            instruction=raw_instruction,
         )
 
         return return_dict

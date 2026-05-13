@@ -33,7 +33,15 @@ def load_touch_editor(
     state_dim: int = 212,
 ) -> ResidualTouchEditor:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model = ResidualTouchEditor(action_dim=action_dim, state_dim=state_dim).to(device)
+    args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
+    model = ResidualTouchEditor(
+        action_dim=int(args.get("action_dim", action_dim)),
+        state_dim=int(args.get("state_dim", state_dim)),
+        touch_feature_dim=int(args.get("touch_feature_dim", 128)),
+        hidden_dim=int(args.get("hidden_dim", 256)),
+        num_layers=int(args.get("num_layers", 2)),
+        condition_mode=str(args.get("condition_mode", "full")),
+    ).to(device)
     state_dict = checkpoint.get("model", checkpoint)
     model.load_state_dict(state_dict)
     return model.eval()
@@ -91,6 +99,7 @@ def apply_touch_editor_once(
     touch_mask: torch.Tensor,
     action_mask: torch.Tensor,
     edit_start_idx: int,
+    use_full_touch_window: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Apply one residual edit to the unexecuted suffix of a normalized VITRA chunk."""
     device = next(editor.parameters()).device
@@ -112,7 +121,10 @@ def apply_touch_editor_once(
 
     edit_start_idx = max(0, min(int(edit_start_idx), int(a_base.shape[1])))
     future_mask = make_future_mask(action_mask, edit_start_idx).to(device)
-    touch_window, touch_window_mask = _touch_history_until(touch_pressure, touch_mask, edit_start_idx)
+    if use_full_touch_window:
+        touch_window, touch_window_mask = touch_pressure, touch_mask
+    else:
+        touch_window, touch_window_mask = _touch_history_until(touch_pressure, touch_mask, edit_start_idx)
     chunk_phase = make_chunk_phase(a_base.shape[0], a_base.shape[1], device)
     delta = editor(
         a_base=a_base,
@@ -140,6 +152,7 @@ def apply_touch_guidance_schedule(
     *,
     fps: float,
     edit_times: Iterable[float] = (0.33, 0.66),
+    use_full_touch_window: bool = False,
 ) -> TouchGuidanceResult:
     """Apply sequential touch edits at second-based offsets within a VITRA chunk."""
     a_work = _as_batch(a_base, 3)
@@ -160,6 +173,7 @@ def apply_touch_guidance_schedule(
             touch_mask=touch_mask,
             action_mask=action_mask,
             edit_start_idx=edit_idx,
+            use_full_touch_window=use_full_touch_window,
         )
         a_history.append(a_edit.detach().cpu())
         deltas.append(delta.detach().cpu())

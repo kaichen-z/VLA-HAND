@@ -30,7 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument(
         "--ablation",
-        choices=("matched", "zero_touch", "shuffled_touch", "random_pair", "no_touch"),
+        choices=("matched", "zero_touch", "shuffled_touch", "random_pair", "no_touch", "future_touch_oracle"),
         default="matched",
         help="Which pseudo-pair/touch ablation to evaluate.",
     )
@@ -124,6 +124,20 @@ def add_delta_stats(totals: dict[str, float], prefix: str, delta: torch.Tensor, 
     totals[f"{prefix}_smoothness_count"] = totals.get(f"{prefix}_smoothness_count", 0.0) + smooth_count
 
 
+def add_prefix_change_stats(
+    totals: dict[str, float],
+    prefix: str,
+    a_edit: torch.Tensor,
+    a_base: torch.Tensor,
+    future_mask: torch.Tensor,
+    action_mask: torch.Tensor,
+) -> None:
+    prefix_mask = (1.0 - future_mask.to(a_edit.dtype)) * action_mask.to(a_edit.dtype)
+    change_sum, change_count = l2_timestep_sum_and_count(a_edit - a_base, prefix_mask)
+    totals[f"{prefix}_prefix_change_l2_sum"] = totals.get(f"{prefix}_prefix_change_l2_sum", 0.0) + change_sum
+    totals[f"{prefix}_prefix_change_l2_count"] = totals.get(f"{prefix}_prefix_change_l2_count", 0.0) + change_count
+
+
 def shuffle_touch(batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = int(batch["touch_pressure"].shape[0])
     if batch_size <= 1:
@@ -179,6 +193,9 @@ def finalize_metrics(totals: dict[str, float], edit_count: int) -> dict[str, flo
         )
         metrics[f"{prefix}_smoothness"] = totals.get(f"{prefix}_smoothness_sum", 0.0) / max(
             totals.get(f"{prefix}_smoothness_count", 0.0), 1.0
+        )
+        metrics[f"{prefix}_prefix_change_l2"] = totals.get(f"{prefix}_prefix_change_l2_sum", 0.0) / max(
+            totals.get(f"{prefix}_prefix_change_l2_count", 0.0), 1.0
         )
     metrics["base_mse"] = metrics.get("edit_1_base_mse", 0.0)
     return metrics
@@ -244,6 +261,7 @@ def main() -> None:
                 action_mask=batch["action_mask"],
                 fps=args.fps,
                 edit_times=args.edit_times,
+                use_full_touch_window=args.ablation == "future_touch_oracle",
             )
             edit_indices.append(result.edit_indices)
             for idx, (a_edit, delta, future_mask) in enumerate(
@@ -256,6 +274,14 @@ def main() -> None:
                 add_hand_mse(totals, f"{prefix}_base", batch["a_base"] - batch["a_target"], editable)
                 add_hand_mse(totals, f"{prefix}_edit", a_edit - batch["a_target"], editable)
                 add_delta_stats(totals, prefix, delta, editable)
+                add_prefix_change_stats(
+                    totals,
+                    prefix,
+                    a_edit,
+                    batch["a_base"],
+                    future_mask.to(args.device),
+                    batch["action_mask"],
+                )
                 totals[f"{prefix}_valid_editable_dims"] = totals.get(f"{prefix}_valid_editable_dims", 0.0) + float(
                     editable.sum().detach().cpu()
                 )

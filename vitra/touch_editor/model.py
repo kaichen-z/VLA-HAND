@@ -14,9 +14,17 @@ class ResidualTouchEditor(nn.Module):
         touch_feature_dim: int = 128,
         hidden_dim: int = 256,
         num_layers: int = 2,
+        condition_mode: str = "full",
     ) -> None:
         super().__init__()
+        if condition_mode not in {"full", "no_base", "touch_only"}:
+            raise ValueError(f"Unsupported condition_mode: {condition_mode}")
         self.action_dim = action_dim
+        self.state_dim = state_dim
+        self.touch_feature_dim = touch_feature_dim
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.condition_mode = condition_mode
         self.touch_encoder = nn.Sequential(
             nn.Conv2d(2, 32, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -28,7 +36,10 @@ class ResidualTouchEditor(nn.Module):
             nn.Linear(64 * 4 * 4, touch_feature_dim),
             nn.ReLU(inplace=True),
         )
-        self.input_proj = nn.Linear(action_dim * 4 + state_dim * 2 + touch_feature_dim + 2, hidden_dim)
+        self.input_proj = nn.Linear(
+            self._feature_dim(action_dim, state_dim, touch_feature_dim, condition_mode),
+            hidden_dim,
+        )
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=8,
@@ -64,22 +75,27 @@ class ResidualTouchEditor(nn.Module):
         action_mask_float = action_mask.to(a_base.dtype)
         future_mask_float = future_mask.to(a_base.dtype)
         touch_valid = aligned_touch_mask.any(dim=-1).to(a_base.dtype)[..., None]
-        features = torch.cat(
-            [
-                a_base,
-                a_base * action_mask_float,
-                action_mask_float,
-                future_mask_float,
-                state_features,
-                state_mask_features,
-                touch_features,
-                touch_valid,
-                phase,
-            ],
-            dim=-1,
-        )
+        feature_parts = []
+        if self.condition_mode == "full":
+            feature_parts.extend([a_base, a_base * action_mask_float])
+        feature_parts.extend([action_mask_float, future_mask_float])
+        if self.condition_mode in {"full", "no_base"}:
+            feature_parts.extend([state_features, state_mask_features])
+        feature_parts.extend([touch_features, touch_valid, phase])
+        features = torch.cat(feature_parts, dim=-1)
         hidden = self.temporal(self.input_proj(features))
         return self.out(hidden)
+
+    @staticmethod
+    def _feature_dim(action_dim: int, state_dim: int, touch_feature_dim: int, condition_mode: str) -> int:
+        dim = action_dim * 2 + touch_feature_dim + 2
+        if condition_mode == "full":
+            dim += action_dim * 2 + state_dim * 2
+        elif condition_mode == "no_base":
+            dim += state_dim * 2
+        elif condition_mode != "touch_only":
+            raise ValueError(f"Unsupported condition_mode: {condition_mode}")
+        return dim
 
     @staticmethod
     def _align_touch_to_chunk(touch_pressure: torch.Tensor, chunk_len: int) -> torch.Tensor:

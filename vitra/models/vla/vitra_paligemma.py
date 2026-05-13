@@ -199,6 +199,15 @@ class VITRA_Paligemma(nn.Module):
         cfg_scale: float = 5.0,
         use_ddim: bool = True,
         num_ddim_steps: int = 10,
+        guidance_fn=None,
+        guidance_scale: float = 0.0,
+        guidance_start_frac: float = 0.0,
+        guidance_end_frac: float = 1.0,
+        guidance_grad_clip: float = 1.0,
+        return_guidance_trace: bool = False,
+        fixed_actions=None,
+        fixed_action_mask=None,
+        return_replan_trace: bool = False,
         **kwargs,
     ):
         
@@ -215,6 +224,18 @@ class VITRA_Paligemma(nn.Module):
 
         action_features_repeated = action_features_repeated.view(B*repeated_diffusion_steps, 1, action_features.shape[-1])
         action_masks_repeated = action_masks_repeated.view(B*repeated_diffusion_steps, action_masks.shape[1], action_masks.shape[2])
+        fixed_actions_repeated = None
+        fixed_action_mask_repeated = None
+        if fixed_actions is not None:
+            fixed_actions_repeated = fixed_actions.unsqueeze(0).repeat(repeated_diffusion_steps, 1, 1, 1)
+            fixed_actions_repeated = fixed_actions_repeated.view(
+                B * repeated_diffusion_steps, fixed_actions.shape[1], fixed_actions.shape[2]
+            )
+        if fixed_action_mask is not None:
+            fixed_action_mask_repeated = fixed_action_mask.unsqueeze(0).repeat(repeated_diffusion_steps, 1, 1, 1)
+            fixed_action_mask_repeated = fixed_action_mask_repeated.view(
+                B * repeated_diffusion_steps, fixed_action_mask.shape[1], fixed_action_mask.shape[2]
+            )
 
         if self.use_state == 'DiT':
             current_state_repeated = current_state.unsqueeze(0).repeat(repeated_diffusion_steps, 1, 1)
@@ -244,9 +265,21 @@ class VITRA_Paligemma(nn.Module):
                 use_ddim,
                 num_ddim_steps,
                 action_masks_repeated, # ori x_mask
+                guidance_fn=guidance_fn,
+                guidance_scale=guidance_scale,
+                guidance_start_frac=guidance_start_frac,
+                guidance_end_frac=guidance_end_frac,
+                guidance_grad_clip=guidance_grad_clip,
+                return_guidance_trace=return_guidance_trace,
+                fixed_actions=fixed_actions_repeated,
+                fixed_action_mask=fixed_action_mask_repeated,
+                return_replan_trace=return_replan_trace,
             )
+            trace = None
+            if return_guidance_trace or return_replan_trace:
+                actions, trace = actions
 
-            return actions, action_loss
+            return actions, trace if (return_guidance_trace or return_replan_trace) else action_loss
 
     def extract_cognition_token(self, output_hs, attention_mask):
         cumulative_sum = attention_mask.cumsum(dim=1)
@@ -329,7 +362,7 @@ class VITRA_Paligemma(nn.Module):
             special_image_mask = (input_ids == self.model.config.image_token_index).unsqueeze(-1)
             special_image_mask = special_image_mask.expand_as(inputs_embeds).to(inputs_embeds.device)
             if inputs_embeds[special_image_mask].numel() != image_features.numel():
-                image_tokens_in_text = torch.sum(input_ids == self.config.image_token_index)
+                image_tokens_in_text = torch.sum(input_ids == self.model.config.image_token_index)
                 raise ValueError(
                     f"Number of images does not match number of special image tokens in the input text. "
                     f"Got {image_tokens_in_text} image tokens in the text but {image_features.shape[0] * image_features.shape[1]} "
@@ -367,6 +400,7 @@ class VITRA_Paligemma(nn.Module):
         current_state: Optional[torch.FloatTensor] = None,
         fov: Optional[torch.FloatTensor] = None,
         use_cache: bool = False,
+        return_hidden_states: bool = False,
         **kwargs,
     ):
 
@@ -390,7 +424,67 @@ class VITRA_Paligemma(nn.Module):
             )
 
         output_hs = outputs.hidden_states[-1]
+        if return_hidden_states:
+            return output_hs, inputs_masks, outputs.hidden_states
         return output_hs, inputs_masks
+
+    def extract_vitkd_features(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        current_state_mask: Optional[torch.BoolTensor] = None,
+        current_state: Optional[torch.FloatTensor] = None,
+        fov: Optional[torch.FloatTensor] = None,
+        shallow_layers: Optional[List[int]] = None,
+        deep_layer: int = -1,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> dict:
+        shallow_layers = shallow_layers or [0, 1]
+        output_hs, inputs_masks, hidden_states = self.prepare_vlm_features(
+            pixel_values,
+            input_ids,
+            attention_mask,
+            current_state_mask,
+            current_state,
+            fov,
+            use_cache,
+            return_hidden_states=True,
+            **kwargs,
+        )
+        layer_outputs = hidden_states[1:]
+        shallow_features = [layer_outputs[idx] for idx in shallow_layers]
+        deep_feature = layer_outputs[deep_layer]
+        return {
+            "cognition": self.extract_cognition_token(output_hs, inputs_masks).squeeze(1),
+            "shallow_features": shallow_features,
+            "deep_feature": deep_feature,
+            "token_mask": inputs_masks,
+        }
+
+    def extract_cognition_features(
+        self,
+        pixel_values: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        current_state_mask: Optional[torch.BoolTensor] = None,
+        current_state: Optional[torch.FloatTensor] = None,
+        fov: Optional[torch.FloatTensor] = None,
+        use_cache: bool = False,
+        **kwargs,
+    ) -> torch.Tensor:
+        output_hs, inputs_masks = self.prepare_vlm_features(
+            pixel_values,
+            input_ids,
+            attention_mask,
+            current_state_mask,
+            current_state,
+            fov,
+            use_cache,
+            **kwargs,
+        )
+        return self.extract_cognition_token(output_hs, inputs_masks).squeeze(1)
 
     def forward(
         self,
@@ -407,6 +501,30 @@ class VITRA_Paligemma(nn.Module):
         mode="train",
         **kwargs,
     ):
+
+        if mode == "vlm_cognition":
+            return self.extract_cognition_features(
+                pixel_values,
+                input_ids,
+                attention_mask=attention_mask,
+                current_state_mask=current_state_mask,
+                current_state=current_state,
+                fov=fov,
+                use_cache=use_cache,
+                **kwargs,
+            )
+
+        if mode == "vitkd_features":
+            return self.extract_vitkd_features(
+                pixel_values,
+                input_ids,
+                attention_mask=attention_mask,
+                current_state_mask=current_state_mask,
+                current_state=current_state,
+                fov=fov,
+                use_cache=use_cache,
+                **kwargs,
+            )
 
         assert mode == "train", f"mode {mode} not supported in the forward function."
 
@@ -456,7 +574,16 @@ class VITRA_Paligemma(nn.Module):
         action_mask_torch=None, 
         fov=None, 
         sample_times=1, 
-        use_cache=False
+        use_cache=False,
+        guidance_fn=None,
+        guidance_scale: float = 0.0,
+        guidance_start_frac: float = 0.0,
+        guidance_end_frac: float = 1.0,
+        guidance_grad_clip: float = 1.0,
+        return_guidance_trace: bool = False,
+        fixed_actions=None,
+        fixed_action_mask=None,
+        return_replan_trace: bool = False,
     ) -> np.ndarray:
         """
         support B = 1 only for now
@@ -518,7 +645,7 @@ class VITRA_Paligemma(nn.Module):
             use_cache=use_cache,
         )
         # handle multiple samples for one input
-        samples, _ = self._forward_act_model(
+        samples, trace = self._forward_act_model(
             vlm_features = output_hs,
             attention_mask = inputs_masks,
             action_masks = x_mask,
@@ -529,8 +656,168 @@ class VITRA_Paligemma(nn.Module):
             cfg_scale = cfg_scale,
             use_ddim = use_ddim,
             num_ddim_steps = num_ddim_steps,
+            guidance_fn=guidance_fn,
+            guidance_scale=guidance_scale,
+            guidance_start_frac=guidance_start_frac,
+            guidance_end_frac=guidance_end_frac,
+            guidance_grad_clip=guidance_grad_clip,
+            return_guidance_trace=return_guidance_trace,
+            fixed_actions=fixed_actions,
+            fixed_action_mask=fixed_action_mask,
+            return_replan_trace=return_replan_trace,
         )
         action_np = samples.cpu().numpy() * x_mask.cpu().numpy()    # sample_times x T x D
+        if return_guidance_trace or return_replan_trace:
+            return action_np, trace
+        return action_np
+
+    @torch.no_grad()
+    def encode_action_condition(
+        self,
+        image,
+        instruction: str,
+        current_state,
+        current_state_mask,
+        fov=None,
+        use_cache=False,
+    ) -> torch.Tensor:
+        """
+        Encode image/text/state once and return the cached action-conditioning
+        feature used by the diffusion action head.
+        """
+        B = current_state.shape[0]
+        assert B == 1, f"Batch size {B} not supported in cached action inference for now."
+        device = current_state.device
+
+        if isinstance(image, np.ndarray):
+            if image.ndim == 3:
+                image = Image.fromarray(image)
+            elif image.ndim == 4:
+                image = [Image.fromarray(im) for im in image]
+            else:
+                raise ValueError(f"Unsupported image shape: {image.shape}")
+
+        model_inputs = self.processor(text="<image>" + instruction, images=image, return_tensors="pt").to(device)
+        pixel_value = model_inputs["pixel_values"]
+        input_ids = model_inputs["input_ids"]
+
+        if isinstance(pixel_value, torch.Tensor):
+            pixel_value = pixel_value.to(device)
+        elif isinstance(pixel_value, dict):
+            pixel_value = {
+                k: torch.stack([pixel_value[idx][k] for idx in range(len(input_ids))]).to(device)
+                for k in pixel_value[0]
+            }
+        else:
+            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_value)}")
+        if pixel_value.dim() == 5:
+            pixel_value = pixel_value.view(-1, *pixel_value.shape[2:])
+
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool).to(device)
+        current_state = current_state.to(device)
+        current_state_mask = current_state_mask.to(device)
+        fov = fov.to(device) if fov is not None else None
+
+        output_hs, inputs_masks = self.prepare_vlm_features(
+            pixel_value,
+            input_ids,
+            attention_mask,
+            current_state_mask,
+            current_state,
+            fov,
+            use_cache=use_cache,
+        )
+        return self.extract_cognition_token(output_hs, inputs_masks)
+
+    def sample_action_from_condition(
+        self,
+        action_features: torch.Tensor,
+        current_state,
+        current_state_mask,
+        action_mask_torch=None,
+        fov=None,
+        sample_times=1,
+        use_ddim=True,
+        num_ddim_steps=10,
+        cfg_scale=5.0,
+        guidance_fn=None,
+        guidance_scale: float = 0.0,
+        guidance_start_frac: float = 0.0,
+        guidance_end_frac: float = 1.0,
+        guidance_grad_clip: float = 1.0,
+        return_guidance_trace: bool = False,
+        fixed_actions=None,
+        fixed_action_mask=None,
+        return_replan_trace: bool = False,
+    ) -> np.ndarray:
+        B = current_state.shape[0]
+        device = current_state.device
+        if action_mask_torch is None:
+            x_mask = torch.zeros(B, self.chunk_size, self.act_model.in_channels, device=device)
+            x_mask[:, :, 51:102] = 1.0
+        else:
+            x_mask = action_mask_torch.to(device)
+
+        model_dtype = next(self.act_model.net.parameters()).dtype
+        action_features = action_features.to(device=device, dtype=model_dtype)
+        if action_features.ndim == 2:
+            action_features = action_features.unsqueeze(1)
+
+        action_features_repeated = action_features.unsqueeze(0).repeat(sample_times, 1, 1, 1)
+        action_features_repeated = action_features_repeated.view(B * sample_times, 1, action_features.shape[-1])
+        action_masks_repeated = x_mask.unsqueeze(0).repeat(sample_times, 1, 1, 1)
+        action_masks_repeated = action_masks_repeated.view(B * sample_times, x_mask.shape[1], x_mask.shape[2])
+
+        fixed_actions_repeated = None
+        fixed_action_mask_repeated = None
+        if fixed_actions is not None:
+            fixed_actions_repeated = fixed_actions.to(device=device, dtype=action_masks_repeated.dtype)
+            fixed_actions_repeated = fixed_actions_repeated.unsqueeze(0).repeat(sample_times, 1, 1, 1)
+            fixed_actions_repeated = fixed_actions_repeated.view(
+                B * sample_times, fixed_actions.shape[1], fixed_actions.shape[2]
+            )
+        if fixed_action_mask is not None:
+            fixed_action_mask_repeated = fixed_action_mask.to(device=device, dtype=action_masks_repeated.dtype)
+            fixed_action_mask_repeated = fixed_action_mask_repeated.unsqueeze(0).repeat(sample_times, 1, 1, 1)
+            fixed_action_mask_repeated = fixed_action_mask_repeated.view(
+                B * sample_times, fixed_action_mask.shape[1], fixed_action_mask.shape[2]
+            )
+
+        if self.use_state == "DiT":
+            current_state_repeated = current_state.to(device).unsqueeze(0).repeat(sample_times, 1, 1)
+            current_state_repeated = current_state_repeated.view(B * sample_times, 1, current_state.shape[1])
+            current_state_mask_repeated = current_state_mask.to(device).unsqueeze(0).repeat(sample_times, 1, 1)
+            current_state_mask_repeated = current_state_mask_repeated.view(
+                B * sample_times, 1, current_state_mask.shape[1]
+            )
+        else:
+            current_state_repeated = None
+            current_state_mask_repeated = None
+
+        samples = self.act_model.sample(
+            action_features_repeated,
+            cfg_scale,
+            current_state_repeated,
+            current_state_mask_repeated,
+            use_ddim,
+            num_ddim_steps,
+            action_masks_repeated,
+            guidance_fn=guidance_fn,
+            guidance_scale=guidance_scale,
+            guidance_start_frac=guidance_start_frac,
+            guidance_end_frac=guidance_end_frac,
+            guidance_grad_clip=guidance_grad_clip,
+            return_guidance_trace=return_guidance_trace,
+            fixed_actions=fixed_actions_repeated,
+            fixed_action_mask=fixed_action_mask_repeated,
+            return_replan_trace=return_replan_trace,
+        )
+        trace = None
+        if return_guidance_trace or return_replan_trace:
+            samples, trace = samples
+        action_np = samples.cpu().numpy() * action_masks_repeated.cpu().numpy()
+        if return_guidance_trace or return_replan_trace:
+            return action_np, trace
         return action_np
 
     def _format_loss(self, loss):

@@ -6,6 +6,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -15,7 +16,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vitra.touch_editor.dataset import TouchEditorCacheDataset
-from vitra.touch_editor.losses import touch_editor_loss
+from vitra.touch_editor.losses import editable_mask, masked_mean_square, touch_editor_loss, zero_delta_loss
 from vitra.touch_editor.model import ResidualTouchEditor
 
 
@@ -29,10 +30,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--init_checkpoint", type=Path, default=None, help="Optional editor checkpoint to initialize from.")
+    parser.add_argument("--condition_mode", choices=("full", "no_base", "touch_only"), default="full")
+    parser.add_argument("--action_dim", type=int, default=192)
+    parser.add_argument("--state_dim", type=int, default=212)
+    parser.add_argument("--touch_feature_dim", type=int, default=128)
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--lambda_dev", type=float, default=0.1)
     parser.add_argument("--lambda_delta", type=float, default=0.01)
     parser.add_argument("--lambda_smooth", type=float, default=0.05)
     parser.add_argument("--lambda_mask", type=float, default=1.0)
+    parser.add_argument("--negative_touch_loss", choices=("none", "zero_delta"), default="none")
+    parser.add_argument("--lambda_shuffle_zero", type=float, default=0.0)
+    parser.add_argument("--lambda_zero_zero", type=float, default=0.0)
+    parser.add_argument("--lambda_margin", type=float, default=0.0)
+    parser.add_argument("--shuffle_margin", type=float, default=0.05)
+    parser.add_argument("--contact_subset", choices=("all", "high_contact"), default="all")
+    parser.add_argument("--high_contact_quantile", type=float, default=0.75)
     parser.add_argument(
         "--touch_ablation",
         choices=("none", "zero_touch"),
@@ -40,6 +54,31 @@ def parse_args() -> argparse.Namespace:
         help="Optionally ablate tactile input during training. Use zero_touch for a no-touch editor.",
     )
     return parser.parse_args()
+
+
+def _score_cache_path(path: Path) -> float:
+    with np.load(path, allow_pickle=False) as payload:
+        contact_score = float(np.asarray(payload.get("observed_touch_contact_score", 0.0)).item())
+        contact_delta = float(np.asarray(payload.get("observed_touch_contact_delta", 0.0)).item())
+    return max(contact_score, contact_delta)
+
+
+def filter_dataset_by_observed_contact(
+    dataset: TouchEditorCacheDataset,
+    *,
+    quantile: float,
+) -> TouchEditorCacheDataset:
+    if not 0.0 <= float(quantile) <= 1.0:
+        raise ValueError("quantile must be between 0 and 1")
+    scored_paths = [(path, _score_cache_path(Path(path))) for path in dataset.paths]
+    if not scored_paths:
+        return dataset
+    threshold = torch.quantile(torch.tensor([score for _, score in scored_paths], dtype=torch.float32), float(quantile)).item()
+    filtered_paths = [path for path, score in scored_paths if score >= threshold]
+    filtered = object.__new__(TouchEditorCacheDataset)
+    filtered.cache_root = dataset.cache_root
+    filtered.paths = filtered_paths
+    return filtered
 
 
 def serializable_args(args: argparse.Namespace) -> dict[str, object]:
@@ -59,12 +98,105 @@ def apply_touch_training_ablation(
     return touch_pressure, touch_mask
 
 
+def shuffled_touch_for_training(
+    touch_pressure: torch.Tensor,
+    touch_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size = int(touch_pressure.shape[0])
+    if batch_size <= 1:
+        return touch_pressure, touch_mask
+    order = torch.roll(torch.arange(batch_size, device=touch_pressure.device), shifts=1)
+    return touch_pressure[order], touch_mask[order]
+
+
+def causal_touch_history_from_batch(
+    touch_pressure: torch.Tensor,
+    touch_mask: torch.Tensor,
+    edit_start_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Keep only touch observations available at each sample's edit time.
+
+    ``edit_start_idx`` is inclusive: editing at index 3 may use tactile
+    observations from indices 0, 1, 2, and 3, but never indices 4+.
+    """
+    if touch_pressure.ndim != 5:
+        raise ValueError(f"touch_pressure must be [B,T,2,16,16], got {tuple(touch_pressure.shape)}")
+    if touch_mask.ndim != 3:
+        raise ValueError(f"touch_mask must be [B,T,2], got {tuple(touch_mask.shape)}")
+    if touch_pressure.shape[:2] != touch_mask.shape[:2]:
+        raise ValueError("touch_pressure and touch_mask batch/time dimensions must match")
+    if touch_pressure.shape[0] == 0:
+        return touch_pressure, touch_mask
+
+    edit_start_idx = torch.as_tensor(edit_start_idx, device=touch_pressure.device, dtype=torch.long).reshape(-1)
+    if edit_start_idx.numel() == 1 and touch_pressure.shape[0] > 1:
+        edit_start_idx = edit_start_idx.expand(touch_pressure.shape[0])
+    if edit_start_idx.numel() != touch_pressure.shape[0]:
+        raise ValueError(
+            f"edit_start_idx must have batch size {touch_pressure.shape[0]}, got {edit_start_idx.numel()}"
+        )
+
+    max_time = int(touch_pressure.shape[1])
+    observed_lens = (edit_start_idx.clamp(min=0, max=max_time - 1) + 1).clamp(min=1, max=max_time)
+    max_observed_len = int(observed_lens.max().item())
+    history = touch_pressure[:, :max_observed_len].clone()
+    history_mask = touch_mask[:, :max_observed_len].clone()
+    time = torch.arange(max_observed_len, device=touch_pressure.device)[None, :]
+    valid_history = time < observed_lens[:, None]
+    history = history * valid_history[:, :, None, None, None].to(history.dtype)
+    history_mask = history_mask & valid_history[:, :, None]
+    return history, history_mask
+
+
+def run_touch_editor(
+    model: ResidualTouchEditor,
+    batch: dict[str, torch.Tensor],
+    touch_pressure: torch.Tensor,
+    touch_mask: torch.Tensor,
+) -> torch.Tensor:
+    return model(
+        batch["a_base"],
+        batch["current_state"],
+        batch["current_state_mask"],
+        touch_pressure,
+        touch_mask,
+        batch["chunk_phase"],
+        batch["future_mask"],
+        batch["action_mask"],
+    )
+
+
+def shuffled_margin_loss(
+    *,
+    a_base: torch.Tensor,
+    a_target: torch.Tensor,
+    delta: torch.Tensor,
+    action_mask: torch.Tensor,
+    future_mask: torch.Tensor,
+    matched_demo_loss: torch.Tensor,
+    margin: float,
+) -> torch.Tensor:
+    editable = editable_mask(action_mask, future_mask).to(delta.dtype)
+    a_edit = a_base + editable * delta
+    shuffled_demo = masked_mean_square(a_edit - a_target, editable)
+    return torch.relu(delta.new_tensor(float(margin)) + matched_demo_loss.detach() - shuffled_demo)
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dataset = TouchEditorCacheDataset(args.cache_root)
+    if args.contact_subset == "high_contact":
+        dataset = filter_dataset_by_observed_contact(dataset, quantile=args.high_contact_quantile)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
-    model = ResidualTouchEditor().to(args.device)
+    model = ResidualTouchEditor(
+        action_dim=args.action_dim,
+        state_dim=args.state_dim,
+        touch_feature_dim=args.touch_feature_dim,
+        hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        condition_mode=args.condition_mode,
+    ).to(args.device)
     if args.init_checkpoint is not None:
         checkpoint = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
         model.load_state_dict(checkpoint.get("model", checkpoint))
@@ -83,16 +215,12 @@ def main() -> None:
                     batch["touch_mask"],
                     args.touch_ablation,
                 )
-                delta = model(
-                    batch["a_base"],
-                    batch["current_state"],
-                    batch["current_state_mask"],
+                touch_pressure, touch_mask = causal_touch_history_from_batch(
                     touch_pressure,
                     touch_mask,
-                    batch["chunk_phase"],
-                    batch["future_mask"],
-                    batch["action_mask"],
+                    batch["edit_start_idx"],
                 )
+                delta = run_touch_editor(model, batch, touch_pressure, touch_mask)
                 losses = touch_editor_loss(
                     batch["a_base"],
                     batch["a_target"],
@@ -105,6 +233,42 @@ def main() -> None:
                     lambda_smooth=args.lambda_smooth,
                     lambda_mask=args.lambda_mask,
                 )
+                total_loss = losses["loss"]
+                if args.negative_touch_loss == "zero_delta":
+                    if args.lambda_shuffle_zero > 0 or args.lambda_margin > 0:
+                        shuffled_pressure, shuffled_mask = shuffled_touch_for_training(touch_pressure, touch_mask)
+                        shuffled_delta = run_touch_editor(model, batch, shuffled_pressure, shuffled_mask)
+                        losses["loss_shuffle_zero"] = zero_delta_loss(
+                            shuffled_delta,
+                            batch["action_mask"],
+                            batch["future_mask"],
+                        )
+                        total_loss = total_loss + args.lambda_shuffle_zero * losses["loss_shuffle_zero"]
+                        if args.lambda_margin > 0:
+                            losses["loss_shuffle_margin"] = shuffled_margin_loss(
+                                a_base=batch["a_base"],
+                                a_target=batch["a_target"],
+                                delta=shuffled_delta,
+                                action_mask=batch["action_mask"],
+                                future_mask=batch["future_mask"],
+                                matched_demo_loss=losses["loss_demo"],
+                                margin=args.shuffle_margin,
+                            )
+                            total_loss = total_loss + args.lambda_margin * losses["loss_shuffle_margin"]
+                    if args.lambda_zero_zero > 0:
+                        zero_delta = run_touch_editor(
+                            model,
+                            batch,
+                            torch.zeros_like(touch_pressure),
+                            torch.zeros_like(touch_mask),
+                        )
+                        losses["loss_zero_touch_zero"] = zero_delta_loss(
+                            zero_delta,
+                            batch["action_mask"],
+                            batch["future_mask"],
+                        )
+                        total_loss = total_loss + args.lambda_zero_zero * losses["loss_zero_touch_zero"]
+                losses["loss"] = total_loss
                 optimizer.zero_grad(set_to_none=True)
                 losses["loss"].backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)

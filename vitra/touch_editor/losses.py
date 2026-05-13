@@ -8,6 +8,14 @@ def masked_mean_square(value: torch.Tensor, mask: torch.Tensor, eps: float = 1e-
     return (value.square() * mask).sum() / mask.sum().clamp_min(eps)
 
 
+def editable_mask(action_mask: torch.Tensor, future_mask: torch.Tensor) -> torch.Tensor:
+    return action_mask.to(future_mask.dtype) * future_mask.to(future_mask.dtype)
+
+
+def zero_delta_loss(delta: torch.Tensor, action_mask: torch.Tensor, future_mask: torch.Tensor) -> torch.Tensor:
+    return masked_mean_square(delta, editable_mask(action_mask, future_mask))
+
+
 def touch_editor_loss(
     a_base: torch.Tensor,
     a_target: torch.Tensor,
@@ -21,8 +29,7 @@ def touch_editor_loss(
     lambda_mask: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     valid = action_mask.to(delta.dtype)
-    future = future_mask.to(delta.dtype)
-    editable = future * valid
+    editable = editable_mask(action_mask, future_mask).to(delta.dtype)
     a_edit = a_base + editable * delta
     if residual_target is None:
         residual_target = a_target - a_base

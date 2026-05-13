@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vitra.touch_editor.cache_utils import build_future_mask
+from scripts.cache_touch_editor_base_actions import observed_touch_stats
 
 
 def parse_edit_start_indices(value: str) -> list[int]:
@@ -66,6 +67,10 @@ def expand_record(record: dict[str, np.ndarray], edit_start_idx: int, source_pat
     out["residual_target"] = (np.asarray(out["a_target"], dtype=np.float32) - np.asarray(out["a_base"], dtype=np.float32)).astype(np.float32)
     out["future_mask"] = build_future_mask(out["action_mask"], edit_start_idx).astype(np.float32)
     out["edit_start_idx"] = np.asarray(edit_start_idx, dtype=np.int64)
+    observed_len, contact_score, contact_delta = observed_touch_stats(out["touch_pressure"], out["touch_mask"], edit_start_idx)
+    out["observed_touch_len"] = np.asarray(observed_len, dtype=np.int64)
+    out["observed_touch_contact_score"] = np.asarray(contact_score, dtype=np.float32)
+    out["observed_touch_contact_delta"] = np.asarray(contact_delta, dtype=np.float32)
     out["source_cache_path"] = np.asarray(str(source_path))
     if "edit_start_idx" in record:
         out["source_edit_start_idx"] = np.asarray(int(np.asarray(record["edit_start_idx"]).item()), dtype=np.int64)

@@ -162,7 +162,12 @@ cython_debug/
 
 .worktrees/
 
-*cache*
+.cache/
+cache/
+cache_*/
+*_cache/
+cache_train/
+cache_test/
 .idea/
 # **/*.png
 **/*.pkl
@@ -188,8 +193,10 @@ runs/
 checkpoints/
 datasets/
 dataset/
+thirdparty/
 data/raw/
 data/processed/
+*.pdf
 *.tar
 *.tar.gz
 *.tgz

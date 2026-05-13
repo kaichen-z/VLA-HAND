@@ -1,0 +1,25 @@
+{
+    "parent": "vitra/configs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano.json",
+    "task_name": "finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano_smoke",
+    "output_root": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano_smoke/checkpoints",
+    "log_root": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano_smoke/logs",
+    "cache_root": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano_smoke/cache",
+    "student_init_checkpoint": "runs/finetune_distill_step140000_joint_kd_all_cam0_keypoints_mano_smoke/init_student/weights.pt",
+    "save_steps": 20,
+    "max_saved_checkpoints": 1,
+    "batch_size": 1,
+    "total_batch_size": 1,
+    "trainer": {
+        "max_steps": 20
+    },
+    "training": {
+        "batch_size_per_gpu": 1,
+        "grad_accum_steps": 1,
+        "max_train_samples": 128,
+        "log_every": 1
+    },
+    "eval_dataset": {
+        "num_eval_clips": 5
+    },
+    "repeated_diffusion_steps": 1
+}

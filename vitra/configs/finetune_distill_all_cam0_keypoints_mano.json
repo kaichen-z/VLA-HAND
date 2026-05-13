@@ -1,0 +1,91 @@
+{
+    "parent": "vitra/configs/human_pretrain_gigahands_real_all_cam0_keypoints_mano_vitra3b_linked.json",
+    "vla_name": "VITRA_EncoderStudent",
+    "task_name": "finetune_distill_all_cam0_keypoints_mano",
+    "output_root": "runs/finetune_distill_all_cam0_keypoints_mano/checkpoints",
+    "log_root": "runs/finetune_distill_all_cam0_keypoints_mano/logs",
+    "cache_root": "runs/finetune_distill_all_cam0_keypoints_mano/cache",
+    "pretrain_path": null,
+    "model_load_path": null,
+    "teacher_config": "vitra/configs/human_pretrain_gigahands_real_all_cam0_keypoints_mano_vitra3b_linked.json",
+    "teacher_checkpoint": "./checkpoints/vitra-vla-3b.pt",
+    "student_init_checkpoint": "runs/finetune_distill_all_cam0_keypoints_mano/init_student/weights.pt",
+    "feature_loss_weight": 1.0,
+    "action_loss_weight": 1.0,
+    "loss_normalization": {
+        "ema_decay": 0.99,
+        "eps": 1e-8
+    },
+    "train_setup": {
+        "freeze_option": "encoder_student_joint"
+    },
+    "distill_train_setup": {
+        "freeze_option": "encoder_student_joint"
+    },
+    "student_vlm": {
+        "student_model_type": "encoder_vlm",
+        "vision_encoder_name": "facebook/dinov2-base",
+        "freeze_vision_encoder": true,
+        "text_encoder_name": "distilbert-base-uncased",
+        "fusion_hidden_size": 1024,
+        "student_output_size": 2304,
+        "include_state_in_fusion": true
+    },
+    "action_model": {
+        "model_type": "DiT-B-6L",
+        "token_size": 2304,
+        "action_dim": 192,
+        "hidden_size": 768
+    },
+    "train_dataset": {
+        "data_root_dir": "datasets/vitra_gigahands_real_all_cam0_keypoints_mano_linked_cleaned",
+        "augmentation": false,
+        "set_none_ratio": 0.0,
+        "data_mix": "gigahands_real_train",
+        "num_workers": 4,
+        "prefetch_factor": null,
+        "flip_augmentation": 1.0,
+        "action_type": "keypoints",
+        "use_rel": false,
+        "clip_len": null,
+        "normalization": true,
+        "state_mask_prob": 0.0,
+        "statistics_dataset_name": "gigahands_real_train",
+        "target_image_height": 224
+    },
+    "eval_dataset": {
+        "data_root_dir": "datasets/vitra_gigahands_real_all_cam0_keypoints_mano_linked_cleaned",
+        "data_mix": "gigahands_real_test",
+        "num_eval_clips": 1495,
+        "eval_sample_strategy": "middle_per_episode"
+    },
+    "batch_size": 2,
+    "total_batch_size": 8,
+    "save_steps": 20000,
+    "max_saved_checkpoints": 3,
+    "trainer": {
+        "learning_rate": 1e-5,
+        "weight_decay": 0.1,
+        "max_epochs": 100000,
+        "max_steps": 50000,
+        "gradient_clip_val": 1.0,
+        "warmup_ratio": null,
+        "lr_scheduler_type": "backbone-freeze-warmup",
+        "enable_gradient_checkpointing": false,
+        "enable_mixed_precision_training": false,
+        "reduce_in_full_precision": true,
+        "sharding_strategy": "shard-grad-op",
+        "action_model_learning_rate": 0.0001,
+        "llm_freeze_step": 0
+    },
+    "training": {
+        "batch_size_per_gpu": 2,
+        "grad_accum_steps": 2,
+        "max_train_samples": 0,
+        "log_every": 50,
+        "lr": 1e-5,
+        "weight_decay": 0.1,
+        "grad_clip": 1.0
+    },
+    "repeated_diffusion_steps": 4
+}
