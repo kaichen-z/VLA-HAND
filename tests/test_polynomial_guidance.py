@@ -140,7 +140,7 @@ def test_compute_region_metrics_reports_guidance_improvement():
     assert guided_metrics["violation_mean"] < baseline_metrics["violation_mean"]
 
 
-def test_vitra_sampling_interfaces_expose_polynomial_guidance_hooks():
+def test_vitra_sampling_interfaces_expose_replanning_guidance_hooks_only():
     import inspect
 
     from vitra.models.action_model.diffusion_policy import DiffusionPolicy
@@ -157,32 +157,26 @@ def test_vitra_sampling_interfaces_expose_polynomial_guidance_hooks():
         "guidance_end_frac",
         "guidance_grad_clip",
         "return_guidance_trace",
+        "fixed_actions",
+        "fixed_action_mask",
+        "return_replan_trace",
     ]:
         assert name in sample_sig.parameters
         assert name in predict_sig.parameters
 
-    assert hasattr(GaussianDiffusion, "ddim_sample_loop_velocity_guided")
+    assert hasattr(GaussianDiffusion, "ddim_sample_loop_replanning_guided")
+    assert not hasattr(GaussianDiffusion, "ddim_sample_loop_velocity_guided")
 
 
-def test_polynomial_guidance_inference_assets_are_present():
+def test_one_shot_polynomial_guidance_entrypoint_is_removed():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
     script = root / "scripts/inference_polynomial_guidance.py"
     config = root / "configs/polynomial_guidance_example.json"
 
-    assert script.exists()
     assert config.exists()
-    text = script.read_text(encoding="utf-8")
-    for flag in [
-        "--guidance_scale",
-        "--guidance_start_frac",
-        "--guidance_end_frac",
-        "--guidance_grad_clip",
-        "--regions_json",
-        "--save_dir",
-    ]:
-        assert flag in text
+    assert not script.exists()
 
 
 def test_diffusion_policy_non_cfg_branch_uses_action_features_as_condition():

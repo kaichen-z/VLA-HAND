@@ -197,6 +197,11 @@ class DiffusionPolicy(nn.Module):
             sample_fn = self.net.forward
 
         if guidance_fn is not None:
+            if fixed_actions is None or fixed_action_mask is None:
+                raise ValueError(
+                    "Inference-time guidance is replanning-only: provide fixed_actions and "
+                    "fixed_action_mask so the executed prefix can be clamped."
+                )
             guidance_fn = CFGAwareGuidanceWrapper(
                 guidance_fn,
                 original_batch_size=B,
@@ -237,21 +242,7 @@ class DiffusionPolicy(nn.Module):
                     eta=0.0
                 )
             else:
-                samples, trace = self.ddim_diffusion.ddim_sample_loop_velocity_guided(
-                    sample_fn,
-                    noise.shape,
-                    noise,
-                    clip_denoised=False,
-                    model_kwargs=model_kwargs,
-                    progress=False,
-                    device=action_features.device,
-                    eta=0.0,
-                    guidance_fn=guidance_fn,
-                    guidance_scale=guidance_scale,
-                    guidance_start_frac=guidance_start_frac,
-                    guidance_end_frac=guidance_end_frac,
-                    guidance_grad_clip=guidance_grad_clip,
-                )
+                raise RuntimeError("unreachable: guidance without fixed prefix is rejected above")
         else:
             samples = self.ddim_diffusion.diffusion.p_sample_loop(
                 sample_fn, 

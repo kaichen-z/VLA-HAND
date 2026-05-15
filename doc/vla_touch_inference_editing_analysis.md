@@ -199,7 +199,8 @@ works at the inspected commit.
 
 ### `scripts/inference_human_prediction.py`
 
-Contains the runtime hook for one-shot inference.
+Contains the runtime hook for feed-forward residual action editing after a VITRA action
+chunk has already been generated.
 
 If `--touch_editor_checkpoint` and `--touch_data_path` are passed:
 

@@ -44,7 +44,7 @@ The current residual touch-editor experiments use frozen VITRA predictions cache
 The converted OpenTouch dataset is expected under this repo:
 
 ```text
-datasets/vitra_opentouch_keypoint_full
+datasets/vitra_opentouch_keypoint_full_text_aligned
 ```
 
 It contains:
@@ -121,6 +121,7 @@ VLA-HAND/
   scripts/
     train_tactile_forward_model.py
     evaluate_tactile_dps_replay.py
+    evaluate_tactile_dps_diffusion_replanning.py
     run_tactile_dps_smoke.py
   configs/
     tactile_dps_opentouch.json
@@ -129,7 +130,7 @@ VLA-HAND/
       dps_style_tactile_guided_action_diffusion.md
 ```
 
-The third-party DPS repo is a reference implementation only. We should not vendor its training code into our runtime path. Use it to verify the DPS update pattern: clean estimate, measurement loss, gradient w.r.t. sample, posterior update.
+The third-party DPS repo is a reference implementation only. We should not vendor its training code into our runtime path. Use it to verify the DPS update pattern: clean estimate, measurement loss, gradient w.r.t. sample, posterior update. The runtime path in this repo is `scripts/evaluate_tactile_dps_diffusion_replanning.py`, which applies the tactile measurement loss inside VITRA's prefix-clamped DDIM replanning sampler.
 
 ---
 

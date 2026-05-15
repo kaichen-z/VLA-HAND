@@ -114,5 +114,9 @@ class TactileDPSGuidance:
         loss, metrics = self._loss(pred_xstart)
         grad = torch.autograd.grad(loss, x_in, retain_graph=False, create_graph=False, allow_unused=False)[0]
         prefix_mask = suffix_action_mask(self.action_mask.to(device=grad.device, dtype=torch.bool), self.edit_start_idx)
+        if prefix_mask.shape[0] != grad.shape[0]:
+            full_mask = torch.zeros_like(grad, dtype=torch.bool)
+            full_mask[: prefix_mask.shape[0]] = prefix_mask
+            prefix_mask = full_mask
         grad = grad * prefix_mask.to(dtype=grad.dtype)
         return grad, loss.detach(), metrics

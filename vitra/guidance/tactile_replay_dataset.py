@@ -17,8 +17,10 @@ class TactileReplayCacheDataset(Dataset):
         *,
         max_samples: int | None = None,
         high_contact_quantile: float | None = None,
+        require_action_features: bool = False,
     ) -> None:
         self.cache_root = Path(cache_root)
+        self.require_action_features = bool(require_action_features)
         paths = sorted(self.cache_root.rglob("*.npz"))
         if high_contact_quantile is not None:
             paths = self._filter_high_contact(paths, high_contact_quantile)
@@ -56,7 +58,12 @@ class TactileReplayCacheDataset(Dataset):
         path = self.paths[idx]
         with np.load(path, allow_pickle=False) as payload:
             sample = {key: payload[key] for key in payload.files}
-        return {
+        if self.require_action_features and "action_features" not in sample:
+            raise KeyError(
+                f"{path} does not contain action_features. Regenerate the replay cache with "
+                "scripts/cache_touch_editor_base_actions.py before diffusion DPS replanning."
+            )
+        out = {
             "a_base": torch.tensor(sample["a_base"], dtype=torch.float32),
             "a_target": torch.tensor(sample["a_target"], dtype=torch.float32),
             "action_mask": torch.tensor(sample["action_mask"], dtype=torch.bool),
@@ -69,6 +76,12 @@ class TactileReplayCacheDataset(Dataset):
             "edit_start_idx": torch.tensor(sample.get("edit_start_idx", 0), dtype=torch.long),
             "path": str(path),
         }
+        if "action_features" in sample:
+            action_features = np.asarray(sample["action_features"], dtype=np.float32)
+            while action_features.ndim > 2 and action_features.shape[0] == 1:
+                action_features = action_features[0]
+            out["action_features"] = torch.tensor(action_features, dtype=torch.float32)
+        return out
 
 
 def move_batch_to_device(batch: dict[str, Any], device: str | torch.device) -> dict[str, Any]:

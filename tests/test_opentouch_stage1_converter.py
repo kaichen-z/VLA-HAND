@@ -6,6 +6,7 @@ from pathlib import Path
 import cv2
 import h5py
 import numpy as np
+import pytest
 import torch
 
 
@@ -33,9 +34,11 @@ def write_opentouch_fixture(
     include_left: bool = False,
     clip_id: str = "clip_000001",
     separate_touch_timestamps: bool = False,
+    h5_stem: str = "synthetic_session",
+    timestamps: np.ndarray | None = None,
 ) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    h5_path = root / "synthetic_session.hdf5"
+    h5_path = root / f"{h5_stem}.hdf5"
     frames = []
     for idx in range(frame_count):
         frame = np.zeros((48, 64, 3), dtype=np.uint8)
@@ -66,7 +69,9 @@ def write_opentouch_fixture(
         if include_left:
             clip.create_dataset("left_hand_landmarks", data=left_landmarks)
             clip.create_dataset("left_pressure", data=np.full((frame_count, 16, 16), 2.0, dtype=np.float32))
-        clip.create_dataset("timestamps", data=np.arange(frame_count, dtype=np.float64) / 30.0)
+        if timestamps is None:
+            timestamps = np.arange(frame_count, dtype=np.float64) / 30.0
+        clip.create_dataset("timestamps", data=np.asarray(timestamps))
         if separate_touch_timestamps:
             touch_timestamps = np.arange(frame_count, dtype=np.float64) / 30.0
             touch_timestamps[5:] += 0.004
@@ -74,6 +79,94 @@ def write_opentouch_fixture(
             clip.create_dataset("touch_timestamps", data=touch_timestamps)
 
     return h5_path
+
+
+def test_opentouch_conversion_matches_labels_by_timestamp_when_demo_ids_repeat(tmp_path):
+    converter = load_converter()
+    input_root = tmp_path / "opentouch_raw"
+    output_root = tmp_path / "vitra_opentouch_keypoint"
+    write_opentouch_fixture(
+        input_root,
+        clip_id="demo_000",
+        h5_stem="session_a",
+        timestamps=np.arange(1000, 1020, dtype=np.int64),
+    )
+    write_opentouch_fixture(
+        input_root,
+        clip_id="demo_000",
+        h5_stem="session_b",
+        timestamps=np.arange(2000, 2020, dtype=np.int64),
+    )
+    labels = input_root / "labels.csv"
+    labels.write_text(
+        "\n".join(
+            [
+                "clip_id,object_name,object_category,environment,action,grip_type,description,ts_start,ts_end",
+                "merged::demo_000,block,tool,lab,pressing,Tip Pinch,Timestamp description for session A.,1000,1019",
+                "merged::demo_001,cup,cup,kitchen,picking up,Small Diameter,Timestamp description for session B.,2000,2019",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = converter.convert_opentouch_to_vitra_stage1(
+        opentouch_root=input_root,
+        output_root=output_root,
+        labels_path=labels,
+        min_frames=17,
+        train_ratio=1.0,
+        write_video=False,
+        require_labels=True,
+    )
+
+    assert report["num_episodes_written"] == 2
+    episodes = {}
+    for episode_path in (output_root / "Annotation" / "opentouch_keypoint_train" / "episodic_annotations").glob("*.npy"):
+        episode = np.load(episode_path, allow_pickle=True).item()
+        h5_stem = Path(episode["opentouch"]["h5_path"]).stem
+        episodes[h5_stem] = episode
+
+    assert episodes["session_a"]["text"]["right"][0][0] == "Timestamp description for session A."
+    assert episodes["session_a"]["opentouch"]["label_clip_id"] == "merged::demo_000"
+    assert episodes["session_a"]["opentouch"]["object_name"] == "block"
+    assert episodes["session_a"]["opentouch"]["label_match_method"] == "timestamp"
+    assert episodes["session_b"]["text"]["right"][0][0] == "Timestamp description for session B."
+    assert episodes["session_b"]["opentouch"]["label_clip_id"] == "merged::demo_001"
+    assert episodes["session_b"]["opentouch"]["object_name"] == "cup"
+    assert episodes["session_b"]["opentouch"]["label_match_method"] == "timestamp"
+
+
+def test_opentouch_conversion_require_labels_rejects_unmatched_clip(tmp_path):
+    converter = load_converter()
+    input_root = tmp_path / "opentouch_raw"
+    output_root = tmp_path / "vitra_opentouch_keypoint"
+    write_opentouch_fixture(
+        input_root,
+        clip_id="demo_000",
+        h5_stem="session_a",
+        timestamps=np.arange(1000, 1020, dtype=np.int64),
+    )
+    labels = input_root / "labels.csv"
+    labels.write_text(
+        "\n".join(
+            [
+                "clip_id,description,ts_start,ts_end",
+                "merged::demo_000,Wrong timestamp description.,3000,3019",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="No label payload"):
+        converter.convert_opentouch_to_vitra_stage1(
+            opentouch_root=input_root,
+            output_root=output_root,
+            labels_path=labels,
+            min_frames=17,
+            train_ratio=1.0,
+            write_video=False,
+            require_labels=True,
+        )
 
 
 def test_opentouch_conversion_writes_keypoint_stage1_episode(tmp_path):

@@ -78,4 +78,8 @@ class TouchEditorCacheDataset(Dataset):
                 out[key] = torch.tensor(sample[key], dtype=torch.float64)
         if "touch_alignment_valid" in sample:
             out["touch_alignment_valid"] = torch.tensor(sample["touch_alignment_valid"], dtype=torch.bool)
+        for key in ("observed_touch_contact_score", "observed_touch_contact_delta", "observed_touch_len"):
+            if key in sample:
+                dtype = torch.long if key == "observed_touch_len" else torch.float32
+                out[key] = torch.tensor(sample[key], dtype=dtype)
         return out

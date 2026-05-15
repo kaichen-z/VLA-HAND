@@ -185,8 +185,11 @@ class CFGAwareGuidanceWrapper:
                 metrics[f"{name}/idx"] = torch.tensor(idx, device=pred_xstart.device)
             metrics["loss_poly"] = loss.detach()
         else:
-            loss, metrics = self.base_guidance_fn(pred_cond)
-            grad = torch.autograd.grad(loss, x_in, retain_graph=False, create_graph=False)[0]
+            if hasattr(self.base_guidance_fn, "gradient"):
+                grad, loss, metrics = self.base_guidance_fn.gradient(x_in, pred_cond)
+            else:
+                loss, metrics = self.base_guidance_fn(pred_cond)
+                grad = torch.autograd.grad(loss, x_in, retain_graph=False, create_graph=False)[0]
         metrics = dict(metrics)
         metrics["cfg/original_batch_size"] = torch.tensor(
             self.original_batch_size,

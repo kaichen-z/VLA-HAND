@@ -16,8 +16,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vitra.touch_editor.dataset import TouchEditorCacheDataset
-from vitra.touch_editor.losses import editable_mask, masked_mean_square, touch_editor_loss, zero_delta_loss
-from vitra.touch_editor.model import ResidualTouchEditor
+from vitra.touch_editor.losses import hand_scope_action_mask, editable_mask, masked_mean_square, touch_editor_loss, zero_delta_loss
+from vitra.touch_editor.model import ResidualTouchEditor, TactileGatedResidualEditor
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,12 +30,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--init_checkpoint", type=Path, default=None, help="Optional editor checkpoint to initialize from.")
+    parser.add_argument("--editor_type", choices=("residual", "tactile_gated"), default="residual")
     parser.add_argument("--condition_mode", choices=("full", "no_base", "touch_only"), default="full")
     parser.add_argument("--action_dim", type=int, default=192)
     parser.add_argument("--state_dim", type=int, default=212)
     parser.add_argument("--touch_feature_dim", type=int, default=128)
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=2)
+    parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--context_dropout_prob", type=float, default=0.0)
+    parser.add_argument("--hand_scope", choices=("both", "left", "right"), default="both")
     parser.add_argument("--lambda_dev", type=float, default=0.1)
     parser.add_argument("--lambda_delta", type=float, default=0.01)
     parser.add_argument("--lambda_smooth", type=float, default=0.05)
@@ -43,8 +47,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--negative_touch_loss", choices=("none", "zero_delta"), default="none")
     parser.add_argument("--lambda_shuffle_zero", type=float, default=0.0)
     parser.add_argument("--lambda_zero_zero", type=float, default=0.0)
+    parser.add_argument("--lambda_zero_delta", dest="lambda_zero_zero", type=float)
     parser.add_argument("--lambda_margin", type=float, default=0.0)
+    parser.add_argument("--lambda_shuffle_margin", dest="lambda_margin", type=float)
     parser.add_argument("--shuffle_margin", type=float, default=0.05)
+    parser.add_argument("--lambda_touch_gate", type=float, default=0.0)
+    parser.add_argument("--contact_weighting", choices=("none", "observed_score", "observed_delta"), default="none")
     parser.add_argument("--contact_subset", choices=("all", "high_contact"), default="all")
     parser.add_argument("--high_contact_quantile", type=float, default=0.75)
     parser.add_argument(
@@ -53,7 +61,32 @@ def parse_args() -> argparse.Namespace:
         default="none",
         help="Optionally ablate tactile input during training. Use zero_touch for a no-touch editor.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lambda_zero_zero is None:
+        args.lambda_zero_zero = 0.0
+    if args.lambda_margin is None:
+        args.lambda_margin = 0.0
+    return args
+
+
+def build_touch_editor(args: argparse.Namespace) -> ResidualTouchEditor | TactileGatedResidualEditor:
+    common = {
+        "action_dim": args.action_dim,
+        "state_dim": args.state_dim,
+        "touch_feature_dim": args.touch_feature_dim,
+        "hidden_dim": args.hidden_dim,
+        "num_layers": args.num_layers,
+        "condition_mode": args.condition_mode,
+    }
+    if args.editor_type == "residual":
+        return ResidualTouchEditor(**common)
+    if args.editor_type == "tactile_gated":
+        return TactileGatedResidualEditor(
+            **common,
+            num_heads=args.num_heads,
+            context_dropout_prob=args.context_dropout_prob,
+        )
+    raise ValueError(f"Unsupported editor_type: {args.editor_type}")
 
 
 def _score_cache_path(path: Path) -> float:
@@ -182,6 +215,38 @@ def shuffled_margin_loss(
     return torch.relu(delta.new_tensor(float(margin)) + matched_demo_loss.detach() - shuffled_demo)
 
 
+def apply_hand_scope_to_batch(batch: dict[str, torch.Tensor], hand_scope: str) -> dict[str, torch.Tensor]:
+    if hand_scope == "both":
+        return batch
+    batch = dict(batch)
+    batch["action_mask"] = hand_scope_action_mask(batch["action_mask"], hand_scope)
+    batch["future_mask"] = batch["future_mask"].to(batch["action_mask"].dtype) * batch["action_mask"].to(batch["future_mask"].dtype)
+    return batch
+
+
+def contact_sample_weight(batch: dict[str, torch.Tensor], mode: str) -> torch.Tensor | None:
+    if mode == "none":
+        return None
+    key = "observed_touch_contact_delta" if mode == "observed_delta" else "observed_touch_contact_score"
+    if key not in batch:
+        return None
+    raw = batch[key].to(dtype=torch.float32).reshape(-1)
+    if raw.numel() == 0:
+        return None
+    centered = raw / raw.detach().mean().clamp_min(1e-6)
+    return centered.clamp(min=0.25, max=4.0)
+
+
+def touch_gate_regularization(model: torch.nn.Module, action_mask: torch.Tensor, future_mask: torch.Tensor) -> torch.Tensor:
+    diagnostics = getattr(model, "last_diagnostics", {})
+    gate = diagnostics.get("touch_gate") if isinstance(diagnostics, dict) else None
+    if not torch.is_tensor(gate):
+        return action_mask.new_tensor(0.0, dtype=torch.float32)
+    editable = editable_mask(action_mask, future_mask).to(gate.dtype)
+    timestep_valid = editable.any(dim=-1, keepdim=True).to(gate.dtype)
+    return masked_mean_square(1.0 - gate, timestep_valid)
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -189,14 +254,7 @@ def main() -> None:
     if args.contact_subset == "high_contact":
         dataset = filter_dataset_by_observed_contact(dataset, quantile=args.high_contact_quantile)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, drop_last=False)
-    model = ResidualTouchEditor(
-        action_dim=args.action_dim,
-        state_dim=args.state_dim,
-        touch_feature_dim=args.touch_feature_dim,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        condition_mode=args.condition_mode,
-    ).to(args.device)
+    model = build_touch_editor(args).to(args.device)
     if args.init_checkpoint is not None:
         checkpoint = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
         model.load_state_dict(checkpoint.get("model", checkpoint))
@@ -210,6 +268,7 @@ def main() -> None:
         while step < args.max_steps:
             for batch in loader:
                 batch = {key: value.to(args.device) if hasattr(value, "to") else value for key, value in batch.items()}
+                batch = apply_hand_scope_to_batch(batch, args.hand_scope)
                 touch_pressure, touch_mask = apply_touch_training_ablation(
                     batch["touch_pressure"],
                     batch["touch_mask"],
@@ -221,6 +280,7 @@ def main() -> None:
                     batch["edit_start_idx"],
                 )
                 delta = run_touch_editor(model, batch, touch_pressure, touch_mask)
+                sample_weight = contact_sample_weight(batch, args.contact_weighting)
                 losses = touch_editor_loss(
                     batch["a_base"],
                     batch["a_target"],
@@ -232,9 +292,13 @@ def main() -> None:
                     lambda_delta=args.lambda_delta,
                     lambda_smooth=args.lambda_smooth,
                     lambda_mask=args.lambda_mask,
+                    sample_weight=sample_weight,
                 )
                 total_loss = losses["loss"]
-                if args.negative_touch_loss == "zero_delta":
+                if args.lambda_touch_gate > 0:
+                    losses["loss_touch_gate"] = touch_gate_regularization(model, batch["action_mask"], batch["future_mask"])
+                    total_loss = total_loss + args.lambda_touch_gate * losses["loss_touch_gate"]
+                if args.negative_touch_loss == "zero_delta" or args.lambda_shuffle_zero > 0 or args.lambda_margin > 0 or args.lambda_zero_zero > 0:
                     if args.lambda_shuffle_zero > 0 or args.lambda_margin > 0:
                         shuffled_pressure, shuffled_mask = shuffled_touch_for_training(touch_pressure, touch_mask)
                         shuffled_delta = run_touch_editor(model, batch, shuffled_pressure, shuffled_mask)

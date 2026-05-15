@@ -6,7 +6,7 @@ from typing import Iterable
 
 import torch
 
-from vitra.touch_editor.model import ResidualTouchEditor
+from vitra.touch_editor.model import ResidualTouchEditor, TactileGatedResidualEditor
 
 
 @dataclass
@@ -16,6 +16,7 @@ class TouchGuidanceResult:
     deltas: list[torch.Tensor]
     edit_indices: list[int]
     future_masks: list[torch.Tensor]
+    diagnostics: list[dict[str, torch.Tensor | float]]
 
 
 def seconds_to_chunk_index(seconds: float, fps: float, chunk_len: int) -> int:
@@ -34,14 +35,23 @@ def load_touch_editor(
 ) -> ResidualTouchEditor:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
-    model = ResidualTouchEditor(
-        action_dim=int(args.get("action_dim", action_dim)),
-        state_dim=int(args.get("state_dim", state_dim)),
-        touch_feature_dim=int(args.get("touch_feature_dim", 128)),
-        hidden_dim=int(args.get("hidden_dim", 256)),
-        num_layers=int(args.get("num_layers", 2)),
-        condition_mode=str(args.get("condition_mode", "full")),
-    ).to(device)
+    editor_type = str(args.get("editor_type", "residual"))
+    common = {
+        "action_dim": int(args.get("action_dim", action_dim)),
+        "state_dim": int(args.get("state_dim", state_dim)),
+        "touch_feature_dim": int(args.get("touch_feature_dim", 128)),
+        "hidden_dim": int(args.get("hidden_dim", 256)),
+        "num_layers": int(args.get("num_layers", 2)),
+        "condition_mode": str(args.get("condition_mode", "full")),
+    }
+    if editor_type == "tactile_gated":
+        model = TactileGatedResidualEditor(
+            **common,
+            num_heads=int(args.get("num_heads", 8)),
+            context_dropout_prob=float(args.get("context_dropout_prob", 0.0)),
+        ).to(device)
+    else:
+        model = ResidualTouchEditor(**common).to(device)
     state_dict = checkpoint.get("model", checkpoint)
     model.load_state_dict(state_dict)
     return model.eval()
@@ -87,6 +97,19 @@ def _touch_history_until(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     history_len = max(1, min(int(edit_start_idx) + 1, int(touch_pressure.shape[1])))
     return touch_pressure[:, :history_len], touch_mask[:, :history_len]
+
+
+def _detach_editor_diagnostics(editor: torch.nn.Module) -> dict[str, torch.Tensor | float]:
+    diagnostics = getattr(editor, "last_diagnostics", {})
+    if not isinstance(diagnostics, dict):
+        return {}
+    out: dict[str, torch.Tensor | float] = {}
+    for key, value in diagnostics.items():
+        if torch.is_tensor(value):
+            out[key] = value.detach().cpu()
+        elif isinstance(value, (float, int)):
+            out[key] = float(value)
+    return out
 
 
 @torch.no_grad()
@@ -160,6 +183,7 @@ def apply_touch_guidance_schedule(
     a_history: list[torch.Tensor] = []
     deltas: list[torch.Tensor] = []
     future_masks: list[torch.Tensor] = []
+    diagnostics: list[dict[str, torch.Tensor | float]] = []
     edit_indices: list[int] = []
     a_edit = a_base
     for edit_time in edit_times:
@@ -178,6 +202,7 @@ def apply_touch_guidance_schedule(
         a_history.append(a_edit.detach().cpu())
         deltas.append(delta.detach().cpu())
         future_masks.append(future_mask.detach().cpu())
+        diagnostics.append(_detach_editor_diagnostics(editor))
         edit_indices.append(edit_idx)
     return TouchGuidanceResult(
         a_edit=a_edit,
@@ -185,4 +210,5 @@ def apply_touch_guidance_schedule(
         deltas=deltas,
         edit_indices=edit_indices,
         future_masks=future_masks,
+        diagnostics=diagnostics,
     )

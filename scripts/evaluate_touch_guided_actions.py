@@ -16,6 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from vitra.touch_editor.dataset import TouchEditorCacheDataset
 from vitra.touch_editor.guidance import apply_touch_guidance_schedule, load_touch_editor
+from vitra.touch_editor.losses import hand_scope_action_mask
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_path", type=Path, default=Path("runs/touch_editor_eval/metrics.json"))
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--hand_scope", choices=("both", "left", "right"), default="both")
     parser.add_argument("--fps", type=float, default=8.0)
     parser.add_argument("--edit_times", type=float, nargs="+", default=[0.33, 0.66])
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -138,6 +141,20 @@ def add_prefix_change_stats(
     totals[f"{prefix}_prefix_change_l2_count"] = totals.get(f"{prefix}_prefix_change_l2_count", 0.0) + change_count
 
 
+def add_gate_stats(totals: dict[str, float], prefix: str, diagnostics: dict[str, object], editable: torch.Tensor) -> None:
+    gate = diagnostics.get("touch_gate") if isinstance(diagnostics, dict) else None
+    if not torch.is_tensor(gate):
+        return
+    gate = gate.to(device=editable.device, dtype=editable.dtype)
+    timestep_valid = editable.any(dim=-1, keepdim=True).to(gate.dtype)
+    totals[f"{prefix}_touch_gate_sum"] = totals.get(f"{prefix}_touch_gate_sum", 0.0) + float(
+        (gate * timestep_valid).sum().detach().cpu()
+    )
+    totals[f"{prefix}_touch_gate_count"] = totals.get(f"{prefix}_touch_gate_count", 0.0) + float(
+        timestep_valid.sum().detach().cpu()
+    )
+
+
 def shuffle_touch(batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     batch_size = int(batch["touch_pressure"].shape[0])
     if batch_size <= 1:
@@ -197,6 +214,9 @@ def finalize_metrics(totals: dict[str, float], edit_count: int) -> dict[str, flo
         metrics[f"{prefix}_prefix_change_l2"] = totals.get(f"{prefix}_prefix_change_l2_sum", 0.0) / max(
             totals.get(f"{prefix}_prefix_change_l2_count", 0.0), 1.0
         )
+        metrics[f"{prefix}_touch_gate_mean"] = totals.get(f"{prefix}_touch_gate_sum", 0.0) / max(
+            totals.get(f"{prefix}_touch_gate_count", 0.0), 1.0
+        )
     metrics["base_mse"] = metrics.get("edit_1_base_mse", 0.0)
     return metrics
 
@@ -207,6 +227,8 @@ def main() -> None:
         args.ablation = "zero_touch"
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     dataset = TouchEditorCacheDataset(args.cache_root)
+    if args.max_samples is not None:
+        dataset.paths = dataset.paths[: max(0, int(args.max_samples))]
     selected_paths: set[str] | None = None
     high_contact_threshold: float | None = None
     if args.subset == "high_contact":
@@ -226,6 +248,8 @@ def main() -> None:
                 if batch is None:
                     continue
             batch = {key: value.to(args.device) if hasattr(value, "to") else value for key, value in batch.items()}
+            if args.hand_scope != "both":
+                batch["action_mask"] = hand_scope_action_mask(batch["action_mask"], args.hand_scope)
             batch_size = int(batch["a_base"].shape[0])
             selected_sample_count += batch_size
             if args.ablation == "random_pair":
@@ -264,8 +288,8 @@ def main() -> None:
                 use_full_touch_window=args.ablation == "future_touch_oracle",
             )
             edit_indices.append(result.edit_indices)
-            for idx, (a_edit, delta, future_mask) in enumerate(
-                zip(result.a_history, result.deltas, result.future_masks), start=1
+            for idx, (a_edit, delta, future_mask, diagnostics) in enumerate(
+                zip(result.a_history, result.deltas, result.future_masks, result.diagnostics), start=1
             ):
                 prefix = f"edit_{idx}"
                 a_edit = a_edit.to(args.device)
@@ -282,6 +306,7 @@ def main() -> None:
                     future_mask.to(args.device),
                     batch["action_mask"],
                 )
+                add_gate_stats(totals, prefix, diagnostics, editable)
                 totals[f"{prefix}_valid_editable_dims"] = totals.get(f"{prefix}_valid_editable_dims", 0.0) + float(
                     editable.sum().detach().cpu()
                 )
@@ -298,6 +323,7 @@ def main() -> None:
             "edit_times": args.edit_times,
             "edit_indices": edit_indices[0] if edit_indices else [],
             "ablation": args.ablation,
+            "hand_scope": args.hand_scope,
             "zero_touch": args.ablation in {"zero_touch", "no_touch"},
             "subset": args.subset,
             "high_contact_quantile": args.high_contact_quantile,

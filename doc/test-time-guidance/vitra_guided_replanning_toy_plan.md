@@ -7,13 +7,9 @@ The goal is to validate a closed-loop style mechanism where VITRA first generate
 action chunk, executes part of it, then **re-runs diffusion to regenerate the unexecuted
 future suffix** under an additional guidance loss.
 
-This is different from the current one-shot guidance code in this repo:
-
-- Current implemented path: run diffusion once at time 0 and guide the whole predicted
-  action chunk during that single generation call.
-- New replanning path: after executing action steps such as `0:5` or `0:10`, call the
-  diffusion sampler again, clamp the already executed prefix, and regenerate only the
-  future suffix.
+This is the only supported diffusion-time guidance path in this repo. The old one-shot
+guidance entrypoint has been removed so guidance is always evaluated as prefix-clamped
+replanning after part of the chunk has already executed.
 
 The toy guidance target is still a polynomial / quadratic region constraint. Later, the
 same replanning interface can be used with tactile, contact, safety, or task-progress
@@ -21,24 +17,20 @@ energies.
 
 ## 2. Current Repo Anchors
 
-The current repo already has the pieces needed for one-shot guided sampling:
+The current repo has the pieces needed for prefix-clamped guided replanning:
 
 - `vitra/guidance/polynomial_guidance.py`
   - `PolynomialRegionLoss`
   - `QuadraticRegion`
   - `CFGAwareGuidanceWrapper`
 - `vitra/models/action_model/gaussian_diffusion.py`
-  - `ddim_sample_loop_velocity_guided(...)`
+  - `ddim_sample_loop_replanning_guided(...)`
 - `vitra/models/action_model/diffusion_policy.py`
   - `DiffusionPolicy.sample(...)`
-- `vitra/modeling_vitra.py`
+- `vitra/models/vla/vitra_paligemma.py`
   - `VITRA_Paligemma.predict_action(...)`
-- `scripts/inference_polynomial_guidance.py`
-  - one-shot polynomial guidance demo
-
-The current implementation does **not** yet support prefix-clamped replanning. The new
-experiment should add this as a separate sampler path rather than overloading the current
-one-shot guidance demo.
+- `scripts/inference_guided_replanning_toy.py`
+  - polynomial guided replanning demo
 
 ## 3. Replanning Scenario
 
@@ -206,7 +198,8 @@ The method should:
 6. perform the guided DDIM update,
 7. return the final action and optional trace.
 
-Keep the existing `ddim_sample_loop_velocity_guided(...)` as the one-shot guidance path.
+Do not add a separate one-shot guidance path. `ddim_sample_loop_replanning_guided(...)`
+is the single DDIM guidance interface.
 
 ### 5.2 Policy API
 
@@ -399,8 +392,8 @@ Recommended tests:
 
 The implementation is successful when:
 
-1. The original one-shot guidance script still works.
-2. The new replanning script runs with a VITRA checkpoint.
+1. Guidance without `fixed_actions/fixed_action_mask` is rejected.
+2. The replanning script runs with a VITRA checkpoint.
 3. K=5 and K=10 replans are saved separately.
 4. Prefix preservation error is near zero.
 5. Suffix region violation decreases for at least one guidance scale.

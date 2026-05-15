@@ -6,7 +6,7 @@ import argparse
 import csv
 import json
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,27 @@ DEFAULT_CONTACT_KEYWORDS = (
 )
 LABEL_TEXT_FIELDS = ("instruction", "text", "description", "caption", "task", "label", "action")
 LABEL_KEY_FIELDS = ("clip_id", "clip", "id", "video_id", "episode_id", "group", "group_path")
+LABEL_TIMESTAMP_START_FIELDS = ("ts_start", "start_ts", "timestamp_start", "start_timestamp")
+LABEL_TIMESTAMP_END_FIELDS = ("ts_end", "end_ts", "timestamp_end", "end_timestamp")
+LABEL_METADATA_FIELDS = (
+    "clip_id",
+    "object_name",
+    "object_category",
+    "environment",
+    "action",
+    "grip_type",
+    "description",
+    "ts_start",
+    "ts_end",
+    "model",
+    "onset_idx",
+    "onset_ts",
+    "peak_idx",
+    "peak_ts",
+    "post_idx",
+    "post_ts",
+    "annotation_file",
+)
 VIDEO_TIMESTAMP_FIELDS = ("video_timestamps", "rgb_timestamps", "image_timestamps", "frame_timestamps", "timestamps")
 TOUCH_TIMESTAMP_FIELDS = (
     "touch_timestamps",
@@ -51,6 +72,7 @@ class OpenTouchClip:
     instruction: str
     label_text: str = ""
     matched_keyword: str = ""
+    label_metadata: dict[str, str] = field(default_factory=dict)
 
 
 def clean_instruction(text: str | None) -> str:
@@ -147,18 +169,76 @@ def match_contact_keyword(text: str, keywords: tuple[str, ...] = DEFAULT_CONTACT
     return ""
 
 
+def timestamp_component_key(value: Any) -> tuple[str, int | float]:
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, np.generic):
+        value = value.item()
+    text = str(value).strip()
+    if text and text.lstrip("-").isdigit():
+        return ("i", int(text))
+    numeric = float(value)
+    if numeric.is_integer() and abs(numeric) > 1e6:
+        return ("i", int(numeric))
+    return ("f", round(numeric, 9))
+
+
+def timestamp_label_key(start: Any, end: Any) -> tuple[tuple[str, int | float], tuple[str, int | float]]:
+    return timestamp_component_key(start), timestamp_component_key(end)
+
+
+def clip_timestamp_label_key(group: h5py.Group) -> tuple[tuple[str, int | float], tuple[str, int | float]] | None:
+    timestamps = read_first_dataset(group, VIDEO_TIMESTAMP_FIELDS)
+    if timestamps is None or len(timestamps) == 0:
+        return None
+    frame_count = min(len(timestamps), len(group["rgb_images_jpeg"]), len(group["right_hand_landmarks"]))
+    if frame_count == 0:
+        return None
+    return timestamp_label_key(timestamps[0], timestamps[frame_count - 1])
+
+
+def label_payload_from_row(row: dict[str, Any], keywords: tuple[str, ...], match_method: str) -> dict[str, str]:
+    text = _row_to_text(row)
+    payload = {
+        "instruction": clean_instruction(text),
+        "label_text": text,
+        "matched_keyword": match_contact_keyword(text, keywords),
+        "label_match_method": match_method,
+    }
+    for key in LABEL_METADATA_FIELDS:
+        if key in row and row[key] not in (None, ""):
+            value_key = "label_clip_id" if key == "clip_id" else key
+            payload[value_key] = str(row[key])
+    return payload
+
+
+def _rows_to_timestamp_label_payloads(
+    rows: list[dict[str, Any]],
+    keywords: tuple[str, ...],
+) -> dict[tuple[tuple[str, int | float], tuple[str, int | float]], dict[str, str]]:
+    payloads: dict[tuple[tuple[str, int | float], tuple[str, int | float]], dict[str, str]] = {}
+    owners: dict[tuple[tuple[str, int | float], tuple[str, int | float]], str] = {}
+    for row in rows:
+        start = first_present(row, list(LABEL_TIMESTAMP_START_FIELDS))
+        end = first_present(row, list(LABEL_TIMESTAMP_END_FIELDS))
+        if start is None or end is None:
+            continue
+        key = timestamp_label_key(start, end)
+        owner = str(first_present(row, list(LABEL_KEY_FIELDS)) or "")
+        if key in payloads:
+            raise ValueError(f"Duplicate OpenTouch label timestamps for {owner!r} and {owners[key]!r}: {key}")
+        payloads[key] = label_payload_from_row(row, keywords, match_method="timestamp")
+        owners[key] = owner
+    return payloads
+
+
 def _rows_to_label_payloads(rows: list[dict[str, Any]], keywords: tuple[str, ...]) -> dict[str, dict[str, str]]:
     payloads: dict[str, dict[str, str]] = {}
     for row in rows:
         clip_key = first_present(row, list(LABEL_KEY_FIELDS))
         if clip_key is None:
             continue
-        text = _row_to_text(row)
-        payload = {
-            "instruction": clean_instruction(text),
-            "label_text": text,
-            "matched_keyword": match_contact_keyword(text, keywords),
-        }
+        payload = label_payload_from_row(row, keywords, match_method="key")
         for key in {str(clip_key), str(row.get("group_path", "")), str(row.get("group", ""))}:
             if key:
                 payloads[key] = payload
@@ -171,11 +251,14 @@ def discover_clips(
     max_files: int | None = None,
     max_clips: int | None = None,
     label_payloads: dict[str, dict[str, str]] | None = None,
+    timestamp_label_payloads: dict[tuple[tuple[str, int | float], tuple[str, int | float]], dict[str, str]] | None = None,
     filter_contact_keywords: bool = False,
+    require_labels: bool = False,
 ) -> list[OpenTouchClip]:
     opentouch_root = Path(opentouch_root)
     labels = labels or {}
     label_payloads = label_payloads or {}
+    timestamp_label_payloads = timestamp_label_payloads or {}
     h5_paths = sorted(
         path
         for pattern in ("*.h5", "*.hdf5")
@@ -189,8 +272,12 @@ def discover_clips(
         with h5py.File(h5_path, "r") as handle:
             for group_path, group in iter_clip_groups(handle):
                 clip_key = Path(group_path).name
-                payload = label_payloads.get(clip_key) or label_payloads.get(group_path) or label_payloads.get(h5_path.stem) or {}
+                timestamp_key = clip_timestamp_label_key(group)
+                payload = timestamp_label_payloads.get(timestamp_key) if timestamp_key is not None else None
+                payload = payload or label_payloads.get(clip_key) or label_payloads.get(group_path) or label_payloads.get(h5_path.stem) or {}
                 instruction = payload.get("instruction") or labels.get(clip_key) or labels.get(group_path) or labels.get(h5_path.stem)
+                if require_labels and not instruction:
+                    raise ValueError(f"No label payload for {h5_path.name}:{group_path}")
                 matched_keyword = payload.get("matched_keyword", "")
                 if filter_contact_keywords and not matched_keyword:
                     continue
@@ -202,6 +289,11 @@ def discover_clips(
                         instruction=clean_instruction(instruction),
                         label_text=payload.get("label_text", instruction or ""),
                         matched_keyword=matched_keyword,
+                        label_metadata={
+                            key: str(value)
+                            for key, value in payload.items()
+                            if key not in {"instruction", "label_text", "matched_keyword"}
+                        },
                     )
                 )
                 if max_clips is not None and len(clips) >= max_clips:
@@ -513,6 +605,7 @@ def build_episode(
             "touch_mask": touch_mask,
             "label_text": source.label_text,
             "matched_keyword": source.matched_keyword,
+            **source.label_metadata,
         },
     }
     if left_pressure is not None:
@@ -549,19 +642,23 @@ def convert_opentouch_to_vitra_stage1(
     contact_keywords: tuple[str, ...] = DEFAULT_CONTACT_KEYWORDS,
     contact_manifest_path: str | Path | None = None,
     touch_alignment_tolerance: float | None = None,
+    require_labels: bool = False,
 ) -> dict[str, Any]:
     opentouch_root = Path(opentouch_root)
     output_root = Path(output_root)
     label_rows = load_label_rows(labels_path)
     labels = _rows_to_labels(label_rows)
     label_payloads = _rows_to_label_payloads(label_rows, contact_keywords)
+    timestamp_label_payloads = _rows_to_timestamp_label_payloads(label_rows, contact_keywords)
     sources = discover_clips(
         opentouch_root,
         labels,
         max_files=max_files,
         max_clips=max_clips,
         label_payloads=label_payloads,
+        timestamp_label_payloads=timestamp_label_payloads,
         filter_contact_keywords=filter_contact_keywords,
+        require_labels=require_labels,
     )
     splits = split_sources(sources, train_ratio=train_ratio, seed=seed)
     if contact_manifest_path is not None:
@@ -584,6 +681,9 @@ def convert_opentouch_to_vitra_stage1(
         "filter_contact_keywords": bool(filter_contact_keywords),
         "touch_alignment_tolerance": touch_alignment_tolerance,
         "video_written": bool(write_video),
+        "require_labels": bool(require_labels),
+        "num_label_rows_seen": len(label_rows),
+        "num_timestamp_label_payloads": len(timestamp_label_payloads),
     }
     (output_root / "Annotation" / "statistics").mkdir(parents=True, exist_ok=True)
 
@@ -650,6 +750,7 @@ def write_contact_manifest(path: str | Path, sources: list[OpenTouchClip], opent
                 "matched_keyword": source.matched_keyword,
                 "label_text": source.label_text,
                 "instruction": source.instruction,
+                **source.label_metadata,
             }
             handle.write(json.dumps(record) + "\n")
 
@@ -670,6 +771,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contact_keywords", nargs="*", default=list(DEFAULT_CONTACT_KEYWORDS))
     parser.add_argument("--contact_manifest_path", type=Path)
     parser.add_argument("--touch_alignment_tolerance", type=float)
+    parser.add_argument("--require_labels", action="store_true")
     return parser.parse_args()
 
 
@@ -690,6 +792,7 @@ def main() -> None:
         contact_keywords=tuple(args.contact_keywords),
         contact_manifest_path=args.contact_manifest_path,
         touch_alignment_tolerance=args.touch_alignment_tolerance,
+        require_labels=args.require_labels,
     )
     print(json.dumps(report, indent=2))
 

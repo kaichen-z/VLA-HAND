@@ -62,6 +62,56 @@ def test_replanning_interfaces_are_exposed():
         assert name in student_forward_sig.parameters
 
     assert hasattr(GaussianDiffusion, "ddim_sample_loop_replanning_guided")
+    assert not hasattr(GaussianDiffusion, "ddim_sample_loop_velocity_guided")
+
+
+def test_diffusion_policy_rejects_one_shot_guidance_without_fixed_prefix():
+    from vitra.guidance.polynomial_guidance import (
+        PolynomialGuidanceConfig,
+        PolynomialRegionLoss,
+        QuadraticRegion,
+    )
+    from vitra.models.action_model.diffusion_policy import DiffusionPolicy
+
+    policy = DiffusionPolicy(
+        token_size=8,
+        model_type="DiT-T",
+        in_channels=4,
+        future_action_window_size=3,
+        use_state=None,
+        diffusion_steps=8,
+    )
+    guidance = PolynomialRegionLoss(
+        PolynomialGuidanceConfig(
+            guide_dims=[0, 1],
+            regions=[
+                QuadraticRegion(
+                    tau=1.0,
+                    center=[0.0, 0.0],
+                    Q=[[1.0, 0.0], [0.0, 1.0]],
+                    radius2=1.0,
+                )
+            ],
+        )
+    )
+
+    with torch.no_grad():
+        try:
+            policy.sample(
+                action_features=torch.zeros(1, 1, 8),
+                cfg_scale=1.0,
+                current_state=None,
+                current_state_mask=None,
+                use_ddim=True,
+                num_ddim_steps=2,
+                action_masks=torch.ones(1, 4, 4),
+                guidance_fn=guidance,
+                guidance_scale=1.0,
+            )
+        except ValueError as exc:
+            assert "replanning" in str(exc).lower()
+        else:
+            raise AssertionError("one-shot guidance without fixed_actions should be rejected")
 
 
 def test_cached_diffusion_only_interfaces_are_exposed():

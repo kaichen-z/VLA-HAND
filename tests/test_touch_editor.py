@@ -1,13 +1,14 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import numpy as np
 import pytest
 import torch
 
 from vitra.touch_editor.dataset import TouchEditorCacheDataset
-from vitra.touch_editor.losses import touch_editor_loss, zero_delta_loss
-from vitra.touch_editor.model import ResidualTouchEditor
+from vitra.touch_editor.losses import hand_scope_action_mask, touch_editor_loss, zero_delta_loss
+from vitra.touch_editor.model import ResidualTouchEditor, TactileGatedResidualEditor
 from vitra.touch_editor.cache_utils import build_future_mask, chunk_phase
 from vitra.touch_editor.guidance import apply_touch_editor_once, apply_touch_guidance_schedule, load_touch_editor, seconds_to_chunk_index
 from vitra.touch_editor.alignment import align_touch_to_timestamps, nearest_timestamp_indices
@@ -34,8 +35,10 @@ from scripts.evaluate_touch_guided_actions import (
 from scripts.evaluate_touch_guided_actions import parse_args as parse_eval_args
 from scripts.expand_touch_editor_samples import assert_design1_record, expand_record
 from scripts.summarize_touch_ablation_metrics import gain
+from scripts.summarize_touch_sensitive_editor import summarize_variant
 from scripts.train_touch_editor import (
     apply_touch_training_ablation,
+    build_touch_editor,
     causal_touch_history_from_batch,
     filter_dataset_by_observed_contact,
     shuffled_margin_loss,
@@ -127,6 +130,83 @@ def test_touch_editor_condition_modes_change_feature_contract():
     assert full(**batch).shape == (2, 3, 12)
     assert no_base(**batch).shape == (2, 3, 12)
     assert touch_only(**batch).shape == (2, 3, 12)
+
+
+def test_tactile_gated_editor_returns_delta_and_gate_diagnostics():
+    model = TactileGatedResidualEditor(
+        action_dim=12,
+        state_dim=8,
+        touch_feature_dim=16,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        context_dropout_prob=0.0,
+        condition_mode="full",
+    )
+    batch = {
+        "a_base": torch.zeros((2, 3, 12), dtype=torch.float32),
+        "current_state": torch.zeros((2, 8), dtype=torch.float32),
+        "current_state_mask": torch.ones((2, 8), dtype=torch.bool),
+        "touch_pressure": torch.ones((2, 2, 2, 16, 16), dtype=torch.float32),
+        "touch_mask": torch.ones((2, 2, 2), dtype=torch.bool),
+        "chunk_phase": torch.linspace(0.0, 1.0, 3),
+        "future_mask": torch.ones((2, 3, 12), dtype=torch.float32),
+        "action_mask": torch.ones((2, 3, 12), dtype=torch.bool),
+    }
+
+    delta = model(**batch)
+    diagnostics = model.last_diagnostics
+
+    assert delta.shape == (2, 3, 12)
+    assert diagnostics["prior_delta"].shape == (2, 3, 12)
+    assert diagnostics["touch_delta"].shape == (2, 3, 12)
+    assert diagnostics["touch_gate"].shape == (2, 3, 1)
+    assert float(diagnostics["touch_gate"].min()) >= 0.0
+    assert float(diagnostics["touch_gate"].max()) <= 1.0
+
+
+def test_tactile_gated_editor_context_dropout_changes_shortcut_inputs():
+    model = TactileGatedResidualEditor(
+        action_dim=12,
+        state_dim=8,
+        touch_feature_dim=16,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        context_dropout_prob=1.0,
+        condition_mode="full",
+    )
+    model.train()
+    batch = {
+        "a_base": torch.randn((2, 3, 12), dtype=torch.float32),
+        "current_state": torch.randn((2, 8), dtype=torch.float32),
+        "current_state_mask": torch.ones((2, 8), dtype=torch.bool),
+        "touch_pressure": torch.ones((2, 2, 2, 16, 16), dtype=torch.float32),
+        "touch_mask": torch.ones((2, 2, 2), dtype=torch.bool),
+        "chunk_phase": torch.linspace(0.0, 1.0, 3),
+        "future_mask": torch.ones((2, 3, 12), dtype=torch.float32),
+        "action_mask": torch.ones((2, 3, 12), dtype=torch.bool),
+    }
+
+    _ = model(**batch)
+    diagnostics = model.last_diagnostics
+
+    assert diagnostics["base_keep_rate"] == pytest.approx(0.0)
+    assert diagnostics["state_keep_rate"] == pytest.approx(0.0)
+
+
+def test_hand_scope_action_mask_can_limit_loss_to_right_hand():
+    mask = torch.ones((1, 2, 6), dtype=torch.bool)
+
+    right = hand_scope_action_mask(mask, "right")
+    left = hand_scope_action_mask(mask, "left")
+    both = hand_scope_action_mask(mask, "both")
+
+    assert not right[..., :3].any()
+    assert right[..., 3:].all()
+    assert left[..., :3].all()
+    assert not left[..., 3:].any()
+    assert both.all()
 
 
 def test_touch_editor_loss_returns_components(tmp_path):
@@ -540,6 +620,15 @@ def test_touch_eval_metrics_use_editable_mask_and_hand_splits():
     assert metrics["edit_1_valid_editable_dims"] == 3.0
 
 
+def test_touch_eval_hand_scope_helper_zeroes_left_dims():
+    action_mask = torch.ones((1, 2, 8), dtype=torch.bool)
+
+    scoped = hand_scope_action_mask(action_mask, "right")
+
+    assert not scoped[..., :4].any()
+    assert scoped[..., 4:].all()
+
+
 def test_touch_eval_ablation_helpers_shuffle_touch_and_targets():
     batch = {
         "touch_pressure": torch.arange(2 * 3 * 2 * 16 * 16, dtype=torch.float32).reshape(2, 3, 2, 16, 16),
@@ -675,6 +764,32 @@ def test_touch_specific_gain_positive_when_matched_beats_baseline():
 
     assert abs_gain == pytest.approx(0.3)
     assert pct_gain == pytest.approx(60.0)
+
+
+def test_touch_sensitive_summary_reports_matched_shuffled_gap(tmp_path):
+    def write_eval(name: str, edit_mse: float) -> None:
+        (tmp_path / name).write_text(
+            json.dumps(
+                {
+                    "edit_1_base_mse": 1.0,
+                    "edit_1_edit_mse": edit_mse,
+                    "edit_1_prefix_change_l2": 0.0,
+                    "edit_1_touch_gate_mean": 0.6,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_eval("eval_variant_matched.json", 0.3)
+    write_eval("eval_variant_shuffled_touch.json", 0.4)
+    write_eval("eval_variant_zero_touch.json", 0.8)
+    write_eval("eval_variant_future_touch_oracle.json", 0.25)
+
+    summary = summarize_variant(tmp_path, "variant")
+
+    assert summary["matched_vs_shuffled_gap"] == pytest.approx(0.1)
+    assert summary["matched_vs_zero_gap"] == pytest.approx(0.5)
+    assert summary["touch_gate_mean"] == pytest.approx(0.6)
 
 
 class ConstantDeltaEditor(torch.nn.Module):
@@ -885,3 +1000,59 @@ def test_load_touch_editor_restores_condition_mode_from_checkpoint(tmp_path):
 
     assert loaded.condition_mode == "touch_only"
     assert loaded.input_proj.in_features == 12 * 2 + 4 + 2
+
+
+def test_load_touch_editor_restores_gated_checkpoint(tmp_path):
+    model = TactileGatedResidualEditor(
+        action_dim=12,
+        state_dim=8,
+        touch_feature_dim=16,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        condition_mode="full",
+        context_dropout_prob=0.25,
+    )
+    ckpt = tmp_path / "gated.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "args": {
+                "editor_type": "tactile_gated",
+                "action_dim": 12,
+                "state_dim": 8,
+                "touch_feature_dim": 16,
+                "hidden_dim": 32,
+                "num_layers": 1,
+                "num_heads": 4,
+                "condition_mode": "full",
+                "context_dropout_prob": 0.25,
+            },
+        },
+        ckpt,
+    )
+
+    loaded = load_touch_editor(ckpt, device="cpu")
+
+    assert isinstance(loaded, TactileGatedResidualEditor)
+    assert loaded.context_dropout_prob == pytest.approx(0.25)
+
+
+def test_build_touch_editor_selects_gated_model():
+    args = SimpleNamespace(
+        editor_type="tactile_gated",
+        action_dim=12,
+        state_dim=8,
+        touch_feature_dim=16,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        condition_mode="no_base",
+        context_dropout_prob=0.25,
+    )
+
+    model = build_touch_editor(args)
+
+    assert isinstance(model, TactileGatedResidualEditor)
+    assert model.condition_mode == "no_base"
+    assert model.context_dropout_prob == pytest.approx(0.25)

@@ -243,6 +243,7 @@ def observed_touch_stats(
 def build_cache_record(
     *,
     a_base: np.ndarray,
+    action_features: np.ndarray | None = None,
     sample: dict[str, Any],
     episode: dict[str, Any],
     frame_id: int,
@@ -299,6 +300,8 @@ def build_cache_record(
         "target_dataset": np.asarray("opentouch"),
         "touch_source": np.asarray("opentouch" if touch_mode != "zeros" else "zeros"),
     }
+    if action_features is not None:
+        record["action_features"] = np.asarray(action_features, dtype=np.float32)
     return record
 
 
@@ -371,9 +374,15 @@ def main() -> None:
             current_state_mask = tensor_on_cuda(sample["current_state_mask"], torch.bool)
             action_mask = tensor_on_cuda(sample["action_mask"], torch.bool)
             fov = tensor_on_cuda(sample["fov"], torch.float32)
-            a_base = model.predict_action(
+            action_features = model.encode_action_condition(
                 image=sample["image_list"][-1],
                 instruction=sample["instruction"],
+                current_state=current_state,
+                current_state_mask=current_state_mask,
+                fov=fov,
+            )
+            a_base = model.sample_action_from_condition(
+                action_features=action_features,
                 current_state=current_state,
                 current_state_mask=current_state_mask,
                 action_mask_torch=action_mask,
@@ -386,6 +395,7 @@ def main() -> None:
             edit_start_idx = choose_edit_start(len(sample["action_list"]), args, rng)
             record = build_cache_record(
                 a_base=a_base,
+                action_features=np.squeeze(action_features.detach().float().cpu().numpy(), axis=0),
                 sample=sample,
                 episode=episode,
                 frame_id=frame_id,
@@ -425,6 +435,9 @@ def main() -> None:
         "hf_repo_id": hf_repo_id,
         "target_source": "opentouch_derived",
         "touch_source": "opentouch" if args.touch_mode != "zeros" else "zeros",
+        "contains_action_features": True,
+        "num_ddim_steps": int(args.num_ddim_steps),
+        "cfg_scale": float(args.cfg_scale),
     }
     (args.cache_root / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(json.dumps(summary, indent=2))

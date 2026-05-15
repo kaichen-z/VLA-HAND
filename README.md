@@ -91,13 +91,18 @@ actual decodable mp4 length.
 
 ### OpenTouch
 
-The converted OpenTouch VITRA-format dataset is released as:
+The converted OpenTouch VITRA-format dataset for tactile action editing is released as:
 
 ```text
 LeoJiangOR/opentouch-vitra-stage1-keypoint-full
 ```
 
-It is used for the tactile action-editing experiments. Each cached editor sample stores:
+The current release uses the text-aligned conversion. The converter matches every
+OpenTouch clip to its annotation by `ts_start/ts_end`, uses the original `description`
+as the VITRA instruction, and fails with `--require_labels` if any clip has no matching
+language annotation.
+
+Each cached editor sample stores:
 
 | Field | Shape | Meaning |
 | --- | ---: | --- |
@@ -107,6 +112,12 @@ It is used for the tactile action-editing experiments. Each cached editor sample
 | `touch_pressure` | `[16, 2, 16, 16]` | two-hand tactile pressure maps |
 | `touch_mask` | `[16, 2]` | valid tactile hand mask |
 
+The local text-aligned dataset path used by the current scripts is:
+
+```text
+datasets/vitra_opentouch_keypoint_full_text_aligned
+```
+
 Download:
 
 ```bash
@@ -114,7 +125,7 @@ cd /path/to/VLA-HAND
 huggingface-cli download \
   --repo-type dataset \
   LeoJiangOR/opentouch-vitra-stage1-keypoint-full \
-  --local-dir datasets/vitra_opentouch_keypoint_full
+  --local-dir datasets/vitra_opentouch_keypoint_full_text_aligned
 ```
 
 ## GigaHands Evaluation
@@ -228,12 +239,33 @@ Run the full OpenTouch editor pipeline:
 
 ```bash
 GPU=7 \
-DATASET_ROOT=$PWD/datasets/vitra_opentouch_keypoint_full \
+DATASET_ROOT=$PWD/datasets/vitra_opentouch_keypoint_full_text_aligned \
 bash scripts/run_online_touch_editor_large.sh
 ```
 
-This script can also convert raw OpenTouch if `datasets/vitra_opentouch_keypoint_full`
+This script can also convert raw OpenTouch if `datasets/vitra_opentouch_keypoint_full_text_aligned`
 does not already exist, but the released converted dataset is the intended sharing path.
+
+To adapt the step-140000 GigaHands-finetuned VITRA checkpoint to OpenTouch first, then
+train tactile editors on cached predictions from the adapted checkpoint, run:
+
+```bash
+GPU=7 \
+SOURCE_CHECKPOINT=/path/to/epoch=0-step=140000.ckpt \
+STAGE=large \
+bash scripts/run_opentouch_step140000_adapt_touch_editor.sh
+```
+
+The launcher performs:
+
+1. preflight checks for the text-aligned OpenTouch dataset and action/statistics files
+2. VITRA OpenTouch adaptation initialized from the GigaHands `step140000` checkpoint
+3. source-vs-adapted VITRA evaluation on OpenTouch test samples
+4. cached train/test action generation for editor learning
+5. tactile editor training and matched/shuffled/zero/future-touch evaluations
+
+Use `STAGE=smoke` for a small end-to-end sanity check before launching the full tmux
+run.
 
 Current 10,000-sample OpenTouch test-cache result:
 
@@ -290,8 +322,16 @@ Representative result:
 ### Tactile DPS-Style Editing
 
 The tactile DPS experiment trains a tactile encoder and an action-conditioned tactile
-forward model on OpenTouch replay cache. At test time, it optimizes the action suffix so
-the predicted tactile embedding/statistics match the observed tactile signal.
+forward model on OpenTouch replay cache. The learned mapping is:
+
+```text
+(current_state, candidate_action_segment, chunk_phase) -> tactile representation
+```
+
+At test time, the tactile loss is used as a diffusion guidance term during
+prefix-clamped DDIM replanning. This is different from the residual action editor: DPS
+does not directly learn `tactile -> action residual`; it learns `action -> tactile`, then
+uses gradients to regenerate the unexecuted suffix.
 
 Smoke test:
 
@@ -303,6 +343,20 @@ Full run:
 
 ```bash
 GPU=0 bash scripts/run_tactile_dps_full_tmux.sh
+```
+
+For diffusion-time tactile replanning, the replay cache must include cached VITRA
+`action_features`. Regenerate the cache with the current
+`scripts/cache_touch_editor_base_actions.py`, then run:
+
+```bash
+python scripts/evaluate_tactile_dps_diffusion_replanning.py \
+  --cache_root runs/online_touch_editor_large/cache_test \
+  --measurement_checkpoint runs/tactile_dps_opentouch_encoder_v1/best.pt \
+  --vla_config vitra/configs/human_pretrain_gigahands_real_all_cam0_keypoints_mano_vitra3b_linked.json \
+  --vla_checkpoint checkpoints/vitra-vla-3b.pt \
+  --output_path runs/tactile_dps_diffusion_replanning/eval.json \
+  --max_samples 256
 ```
 
 Measurement model result:
@@ -320,8 +374,9 @@ Replay editing result is currently very small:
 | all samples | 0.7176356267 | 0.7176356078 |
 | high-contact samples | 0.7513158663 | 0.7513158556 |
 
-This means the measurement model can fit tactile summaries, but the current DPS replay
-edit does not yet produce a meaningful action-space improvement.
+This means the measurement model can fit tactile summaries, but the earlier action-space
+replay edit did not yet produce a meaningful action-space improvement. The diffusion
+replanning script is the intended DPS path going forward.
 
 Diffusion-only guided regeneration latency:
 
@@ -337,9 +392,11 @@ Diffusion-only guided regeneration latency:
 - `tools/evaluate_gigahands_stage1.py`: evaluate base vs finetuned checkpoints
 - `scripts/evaluate_gigahands_cleaned.sh`: reproducible cleaned-test evaluation
 - `scripts/run_online_touch_editor_large.sh`: OpenTouch residual action-editor pipeline
+- `scripts/run_opentouch_step140000_adapt_touch_editor.sh`: OpenTouch adaptation plus tactile-editor pipeline from the GigaHands step-140000 checkpoint
 - `scripts/train_touch_editor.py`: train the learned residual editor
 - `scripts/evaluate_touch_guided_actions.py`: evaluate editor ablations
 - `scripts/inference_guided_replanning_toy.py`: polynomial guided replanning toy
+- `scripts/evaluate_tactile_dps_diffusion_replanning.py`: tactile DPS diffusion replanning evaluation
 - `scripts/run_tactile_dps_smoke.sh`: tactile DPS smoke test
 - `scripts/run_tactile_dps_full_tmux.sh`: tactile DPS full tmux launcher
 - `doc/distillation_and_test_time_guidance_report.md`: distillation and guidance report

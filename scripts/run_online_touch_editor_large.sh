@@ -8,7 +8,7 @@ GPU="${GPU:-7}"
 OPENTOUCH_ROOT="${OPENTOUCH_ROOT:-${REPO_ROOT}/datasets/opentouch_raw}"
 ANNOTATIONS_DIR="${ANNOTATIONS_DIR:-${OPENTOUCH_ROOT}/final_annotations}"
 LABELS_PATH="${LABELS_PATH:-${OPENTOUCH_ROOT}/final_annotations_merged.csv}"
-DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/datasets/vitra_opentouch_keypoint_full}"
+DATASET_ROOT="${DATASET_ROOT:-${REPO_ROOT}/datasets/vitra_opentouch_keypoint_full_text_aligned}"
 RUN_ROOT="${RUN_ROOT:-${REPO_ROOT}/runs/online_touch_editor_large}"
 CONFIG="${CONFIG:-${REPO_ROOT}/vitra/configs/human_pretrain_opentouch_keypoint_subset.json}"
 CHECKPOINT="${CHECKPOINT:-${REPO_ROOT}/runs/gigahands_real_all_cam0_keypoints_mano_vitra3b_linked_train/checkpoints/gigahands_real_all_cam0_keypoints_mano_vitra3b_linked_stage1_TB2_B2_bf16True/checkpoints/epoch=0-step=140000.ckpt}"
@@ -42,7 +42,8 @@ if [[ ! -f "${DATASET_ROOT}/Annotation/opentouch_keypoint_train/episode_frame_in
     --labels_path "${LABELS_PATH}" \
     --min_frames 17 \
     --train_ratio 0.8 \
-    --write_video
+    --write_video \
+    --require_labels
 else
   echo "[1/8] Dataset already exists at ${DATASET_ROOT}; skipping raw annotation merge."
   echo "[2/8] Dataset already exists at ${DATASET_ROOT}; skipping conversion."
