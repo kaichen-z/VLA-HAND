@@ -7,6 +7,7 @@ The current code supports four related workflows:
 
 - GigaHands fine-tuning and evaluation for VITRA future hand-action prediction.
 - VITRA student distillation for faster VLA backend and diffusion-head inference.
+- OpenTouch visual/pose-to-tactile retrieval encoder training.
 - OpenTouch action editing with a learned tactile-conditioned residual editor.
 - Test-time diffusion editing / replanning with polynomial guidance and tactile DPS-style guidance.
 
@@ -127,6 +128,69 @@ huggingface-cli download \
   LeoJiangOR/opentouch-vitra-stage1-keypoint-full \
   --local-dir datasets/vitra_opentouch_keypoint_full_text_aligned
 ```
+
+## OpenTouch Retrieval Encoder
+
+The OpenTouch retrieval encoder is separate from VITRA action prediction. It trains
+OpenTouch's cross-modal encoder system to align RGB + right-hand 3D landmarks with
+tactile pressure windows:
+
+```text
+task_type: vp2t
+query:  rgb_images [B, 20, 3, 224, 224] + hand_landmarks [B, 20, 21, 3]
+target: tactile_pressure [B, 20, 1, 16, 16]
+output: normalized 64-d embeddings
+```
+
+The best saved checkpoint is released as:
+
+```text
+LeoJiangOR/opentouch-vp2t-encoder-best
+```
+
+Download:
+
+```bash
+huggingface-cli download \
+  LeoJiangOR/opentouch-vp2t-encoder-best \
+  --local-dir checkpoints/opentouch-vp2t-encoder-best
+```
+
+The released checkpoint is `epoch_280.pt`, selected by best saved average
+bidirectional mAP. Validation metrics on 2,985 OpenTouch windows:
+
+| Direction | R@1 | R@5 | R@10 | mAP |
+| --- | ---: | ---: | ---: | ---: |
+| visual+pose -> tactile | 0.0610 | 0.2228 | 0.3374 | 0.1536 |
+| tactile -> visual+pose | 0.0633 | 0.2281 | 0.3420 | 0.1525 |
+
+To reproduce the encoder training from raw OpenTouch data:
+
+```bash
+cd /path/to/VLA-HAND
+RAW_ROOT=/path/to/opentouch_raw \
+DATASET_ROOT=$PWD/datasets/opentouch_official_retrieval_hf \
+STAGE=full \
+GPU=auto \
+BATCH_SIZE=4 \
+EPOCHS=300 \
+bash scripts/run_opentouch_official_encoder_train.sh
+```
+
+Useful stages:
+
+```text
+STAGE=preflight  check raw OpenTouch and runtime prerequisites
+STAGE=build      build the Hugging Face retrieval dataset
+STAGE=check      inspect the built dataset
+STAGE=smoke      run a one-epoch smoke test
+STAGE=full       launch the full retrieval training
+```
+
+The training script clones the OpenTouch repo into `thirdparty/OpenTouch-MIT-opentouch`
+when needed and writes the model config `OpenTouch-DINOv3-B16-AllModalities.json`.
+The visual backbone is frozen and defaults to `google/vit-base-patch16-224-in21k` so
+the run does not require gated DINOv3 access.
 
 ## GigaHands Evaluation
 
@@ -391,6 +455,7 @@ Diffusion-only guided regeneration latency:
 - `tools/clean_gigahands_linked_dataset.py`: remove invalid video-frame samples
 - `tools/evaluate_gigahands_stage1.py`: evaluate base vs finetuned checkpoints
 - `scripts/evaluate_gigahands_cleaned.sh`: reproducible cleaned-test evaluation
+- `scripts/run_opentouch_official_encoder_train.sh`: OpenTouch visual/pose-to-tactile retrieval encoder training
 - `scripts/run_online_touch_editor_large.sh`: OpenTouch residual action-editor pipeline
 - `scripts/run_opentouch_step140000_adapt_touch_editor.sh`: OpenTouch adaptation plus tactile-editor pipeline from the GigaHands step-140000 checkpoint
 - `scripts/train_touch_editor.py`: train the learned residual editor
