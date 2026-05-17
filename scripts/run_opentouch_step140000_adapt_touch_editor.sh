@@ -38,6 +38,10 @@ NUM_WORKERS="${NUM_WORKERS:-2}"
 EDIT_START_IDX="${EDIT_START_IDX:-3}"
 DDIM_STEPS="${DDIM_STEPS:-10}"
 CFG_SCALE="${CFG_SCALE:-5.0}"
+PRETRAINED_TOUCH_ENCODER_CHECKPOINT="${PRETRAINED_TOUCH_ENCODER_CHECKPOINT:-${REPO_ROOT}/checkpoints/opentouch-vp2t-encoder-best/epoch_280.pt}"
+if [[ ! -f "${PRETRAINED_TOUCH_ENCODER_CHECKPOINT}" ]]; then
+  PRETRAINED_TOUCH_ENCODER_CHECKPOINT="${REPO_ROOT}/runs/opentouch_official_encoder_train/logs/opentouch_encoder_restart_20260515_085839/checkpoints/epoch_280.pt"
+fi
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
@@ -278,6 +282,30 @@ train_editors() {
       --lambda_smooth 0.05 \
       --device cuda
   fi
+  if [[ ! -f "${editor_root}/pretrained_right_contrastive/latest.pt" ]]; then
+    "${PYTHON_BIN}" scripts/train_touch_editor.py \
+      --cache_root "${cache_train}" \
+      --output_dir "${editor_root}/pretrained_right_contrastive" \
+      --batch_size "${EDITOR_BATCH_SIZE}" \
+      --max_steps "${steps}" \
+      --editor_type pretrained_tactile_gated \
+      --condition_mode full \
+      --context_dropout_prob 0.3 \
+      --hand_scope right \
+      --pretrained_touch_encoder_checkpoint "${PRETRAINED_TOUCH_ENCODER_CHECKPOINT}" \
+      --pretrained_touch_hand right \
+      --freeze_pretrained_touch_encoder true \
+      --lambda_dev 1.0 \
+      --lambda_delta 0.01 \
+      --lambda_smooth 0.05 \
+      --lambda_shuffle_zero 0.1 \
+      --lambda_zero_zero 0.05 \
+      --lambda_margin 0.05 \
+      --shuffle_margin 0.05 \
+      --lambda_touch_gate 0.01 \
+      --contact_weighting observed_delta \
+      --device cuda
+  fi
 }
 
 eval_editors() {
@@ -285,7 +313,7 @@ eval_editors() {
   local editor_root="$2"
   local eval_tag="$3"
   export CUDA_VISIBLE_DEVICES="${GPU}"
-  for editor in gated_full_contrastive gated_no_base_contrastive zero_touch_control; do
+  for editor in gated_full_contrastive gated_no_base_contrastive zero_touch_control pretrained_right_contrastive; do
     for ablation in matched shuffled_touch zero_touch future_touch_oracle; do
       "${PYTHON_BIN}" scripts/evaluate_touch_guided_actions.py \
         --cache_root "${cache_test}" \

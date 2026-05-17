@@ -24,6 +24,10 @@ EDITOR_BATCH_SIZE="${EDITOR_BATCH_SIZE:-256}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-}"
+PRETRAINED_TOUCH_ENCODER_CHECKPOINT="${PRETRAINED_TOUCH_ENCODER_CHECKPOINT:-${REPO_ROOT}/checkpoints/opentouch-vp2t-encoder-best/epoch_280.pt}"
+if [[ ! -f "${PRETRAINED_TOUCH_ENCODER_CHECKPOINT}" ]]; then
+  PRETRAINED_TOUCH_ENCODER_CHECKPOINT="${REPO_ROOT}/runs/opentouch_official_encoder_train/logs/opentouch_encoder_restart_20260515_085839/checkpoints/epoch_280.pt"
+fi
 
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${GPU}"
@@ -119,8 +123,22 @@ train_editor gated_no_base_contrastive \
   --lambda_zero_delta 1.0 \
   --lambda_touch_gate 0.01
 
+train_editor pretrained_right_contrastive \
+  --editor_type pretrained_tactile_gated \
+  --condition_mode full \
+  --hand_scope right \
+  --context_dropout_prob 0.30 \
+  --pretrained_touch_encoder_checkpoint "${PRETRAINED_TOUCH_ENCODER_CHECKPOINT}" \
+  --pretrained_touch_hand right \
+  --freeze_pretrained_touch_encoder true \
+  --contact_weighting observed_delta \
+  --lambda_shuffle_margin 1.0 \
+  --shuffle_margin 0.03 \
+  --lambda_zero_delta 1.0 \
+  --lambda_touch_gate 0.01
+
 echo "[3/4] Evaluate variants"
-for variant in baseline_residual_full gated_right_dropout gated_right_contrastive gated_no_base_contrastive; do
+for variant in baseline_residual_full gated_right_dropout gated_right_contrastive gated_no_base_contrastive pretrained_right_contrastive; do
   for ablation in matched shuffled_touch zero_touch future_touch_oracle; do
     eval_editor "${variant}" "${ablation}"
   done

@@ -6,7 +6,11 @@ from typing import Iterable
 
 import torch
 
-from vitra.touch_editor.model import ResidualTouchEditor, TactileGatedResidualEditor
+from vitra.touch_editor.model import (
+    PretrainedTactileGatedResidualEditor,
+    ResidualTouchEditor,
+    TactileGatedResidualEditor,
+)
 
 
 @dataclass
@@ -32,14 +36,13 @@ def load_touch_editor(
     *,
     action_dim: int = 192,
     state_dim: int = 212,
-) -> ResidualTouchEditor:
+) -> ResidualTouchEditor | TactileGatedResidualEditor | PretrainedTactileGatedResidualEditor:
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     args = checkpoint.get("args", {}) if isinstance(checkpoint, dict) else {}
     editor_type = str(args.get("editor_type", "residual"))
     common = {
         "action_dim": int(args.get("action_dim", action_dim)),
         "state_dim": int(args.get("state_dim", state_dim)),
-        "touch_feature_dim": int(args.get("touch_feature_dim", 128)),
         "hidden_dim": int(args.get("hidden_dim", 256)),
         "num_layers": int(args.get("num_layers", 2)),
         "condition_mode": str(args.get("condition_mode", "full")),
@@ -47,11 +50,22 @@ def load_touch_editor(
     if editor_type == "tactile_gated":
         model = TactileGatedResidualEditor(
             **common,
+            touch_feature_dim=int(args.get("touch_feature_dim", 128)),
             num_heads=int(args.get("num_heads", 8)),
             context_dropout_prob=float(args.get("context_dropout_prob", 0.0)),
         ).to(device)
+    elif editor_type == "pretrained_tactile_gated":
+        model = PretrainedTactileGatedResidualEditor(
+            **common,
+            num_heads=int(args.get("num_heads", 8)),
+            context_dropout_prob=float(args.get("context_dropout_prob", 0.0)),
+            pretrained_touch_encoder_checkpoint=None,
+            pretrained_touch_embed_dim=int(args.get("pretrained_touch_embed_dim", 64)),
+            pretrained_touch_hand=str(args.get("pretrained_touch_hand", "right")),
+            freeze_pretrained_touch_encoder=bool(args.get("freeze_pretrained_touch_encoder", True)),
+        ).to(device)
     else:
-        model = ResidualTouchEditor(**common).to(device)
+        model = ResidualTouchEditor(**common, touch_feature_dim=int(args.get("touch_feature_dim", 128))).to(device)
     state_dict = checkpoint.get("model", checkpoint)
     model.load_state_dict(state_dict)
     return model.eval()

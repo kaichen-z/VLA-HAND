@@ -17,7 +17,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from vitra.touch_editor.dataset import TouchEditorCacheDataset
 from vitra.touch_editor.losses import hand_scope_action_mask, editable_mask, masked_mean_square, touch_editor_loss, zero_delta_loss
-from vitra.touch_editor.model import ResidualTouchEditor, TactileGatedResidualEditor
+from vitra.touch_editor.model import (
+    PretrainedTactileGatedResidualEditor,
+    ResidualTouchEditor,
+    TactileGatedResidualEditor,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,11 +34,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--init_checkpoint", type=Path, default=None, help="Optional editor checkpoint to initialize from.")
-    parser.add_argument("--editor_type", choices=("residual", "tactile_gated"), default="residual")
+    parser.add_argument("--editor_type", choices=("residual", "tactile_gated", "pretrained_tactile_gated"), default="residual")
     parser.add_argument("--condition_mode", choices=("full", "no_base", "touch_only"), default="full")
     parser.add_argument("--action_dim", type=int, default=192)
     parser.add_argument("--state_dim", type=int, default=212)
     parser.add_argument("--touch_feature_dim", type=int, default=128)
+    parser.add_argument("--pretrained_touch_encoder_checkpoint", type=Path, default=None)
+    parser.add_argument("--pretrained_touch_encoder_config", type=Path, default=None)
+    parser.add_argument("--pretrained_touch_embed_dim", type=int, default=64)
+    parser.add_argument("--pretrained_touch_hand", choices=("left", "right"), default="right")
+    parser.add_argument(
+        "--freeze_pretrained_touch_encoder",
+        type=lambda value: str(value).lower() in {"1", "true", "yes", "y"},
+        default=True,
+    )
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--num_layers", type=int, default=2)
     parser.add_argument("--num_heads", type=int, default=8)
@@ -69,22 +82,34 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def build_touch_editor(args: argparse.Namespace) -> ResidualTouchEditor | TactileGatedResidualEditor:
+def build_touch_editor(args: argparse.Namespace) -> ResidualTouchEditor | TactileGatedResidualEditor | PretrainedTactileGatedResidualEditor:
     common = {
         "action_dim": args.action_dim,
         "state_dim": args.state_dim,
-        "touch_feature_dim": args.touch_feature_dim,
         "hidden_dim": args.hidden_dim,
         "num_layers": args.num_layers,
         "condition_mode": args.condition_mode,
     }
     if args.editor_type == "residual":
-        return ResidualTouchEditor(**common)
+        return ResidualTouchEditor(**common, touch_feature_dim=args.touch_feature_dim)
     if args.editor_type == "tactile_gated":
         return TactileGatedResidualEditor(
             **common,
+            touch_feature_dim=args.touch_feature_dim,
             num_heads=args.num_heads,
             context_dropout_prob=args.context_dropout_prob,
+        )
+    if args.editor_type == "pretrained_tactile_gated":
+        if args.pretrained_touch_encoder_checkpoint is None and args.init_checkpoint is None:
+            raise ValueError("--pretrained_touch_encoder_checkpoint is required for pretrained_tactile_gated training")
+        return PretrainedTactileGatedResidualEditor(
+            **common,
+            num_heads=args.num_heads,
+            context_dropout_prob=args.context_dropout_prob,
+            pretrained_touch_encoder_checkpoint=args.pretrained_touch_encoder_checkpoint,
+            pretrained_touch_embed_dim=args.pretrained_touch_embed_dim,
+            pretrained_touch_hand=args.pretrained_touch_hand,
+            freeze_pretrained_touch_encoder=args.freeze_pretrained_touch_encoder,
         )
     raise ValueError(f"Unsupported editor_type: {args.editor_type}")
 
@@ -258,7 +283,10 @@ def main() -> None:
     if args.init_checkpoint is not None:
         checkpoint = torch.load(args.init_checkpoint, map_location=args.device, weights_only=False)
         model.load_state_dict(checkpoint.get("model", checkpoint))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise ValueError("Touch editor has no trainable parameters")
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=1e-4)
 
     metrics_path = args.output_dir / "metrics.jsonl"
     step = 0

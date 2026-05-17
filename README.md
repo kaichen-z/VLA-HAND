@@ -299,6 +299,17 @@ It receives VITRA's base action, current state, action mask, chunk phase, and ca
 tactile history up to the edit time. It is not allowed to modify the already executed
 prefix.
 
+The editor also supports a pretrained tactile-prior variant:
+
+```text
+editor_type=pretrained_tactile_gated
+```
+
+This variant loads the frozen OpenTouch VP2T tactile encoder checkpoint, extracts a
+right-hand tactile embedding from causal tactile history, and uses that embedding in the
+residual editor's tactile gate. The intended test is whether matched tactile produces a
+larger improvement than shuffled tactile, not only whether the action MSE decreases.
+
 Run the full OpenTouch editor pipeline:
 
 ```bash

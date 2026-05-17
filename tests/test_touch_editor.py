@@ -8,7 +8,12 @@ import torch
 
 from vitra.touch_editor.dataset import TouchEditorCacheDataset
 from vitra.touch_editor.losses import hand_scope_action_mask, touch_editor_loss, zero_delta_loss
-from vitra.touch_editor.model import ResidualTouchEditor, TactileGatedResidualEditor
+from vitra.touch_editor.model import (
+    OpenTouchCNNetEmbedding,
+    PretrainedTactileGatedResidualEditor,
+    ResidualTouchEditor,
+    TactileGatedResidualEditor,
+)
 from vitra.touch_editor.cache_utils import build_future_mask, chunk_phase
 from vitra.touch_editor.guidance import apply_touch_editor_once, apply_touch_guidance_schedule, load_touch_editor, seconds_to_chunk_index
 from vitra.touch_editor.alignment import align_touch_to_timestamps, nearest_timestamp_indices
@@ -193,6 +198,102 @@ def test_tactile_gated_editor_context_dropout_changes_shortcut_inputs():
 
     assert diagnostics["base_keep_rate"] == pytest.approx(0.0)
     assert diagnostics["state_keep_rate"] == pytest.approx(0.0)
+
+
+class ConstantTactileEncoder(torch.nn.Module):
+    def __init__(self, emb_dim: int = 64):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(1))
+        self.emb_dim = emb_dim
+
+    def forward(self, touch: torch.Tensor) -> torch.Tensor:
+        return torch.ones((touch.shape[0], self.emb_dim), device=touch.device, dtype=touch.dtype) * self.weight
+
+
+def test_pretrained_tactile_gated_editor_uses_frozen_encoder_and_returns_delta():
+    model = PretrainedTactileGatedResidualEditor(
+        action_dim=12,
+        state_dim=8,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        condition_mode="full",
+        pretrained_touch_encoder=ConstantTactileEncoder(),
+        pretrained_touch_embed_dim=64,
+        freeze_pretrained_touch_encoder=True,
+    )
+    batch = {
+        "a_base": torch.zeros((2, 3, 12), dtype=torch.float32),
+        "current_state": torch.zeros((2, 8), dtype=torch.float32),
+        "current_state_mask": torch.ones((2, 8), dtype=torch.bool),
+        "touch_pressure": torch.ones((2, 2, 2, 16, 16), dtype=torch.float32),
+        "touch_mask": torch.ones((2, 2, 2), dtype=torch.bool),
+        "chunk_phase": torch.linspace(0.0, 1.0, 3),
+        "future_mask": torch.ones((2, 3, 12), dtype=torch.float32),
+        "action_mask": torch.ones((2, 3, 12), dtype=torch.bool),
+    }
+
+    delta = model(**batch)
+
+    assert delta.shape == (2, 3, 12)
+    assert not any(param.requires_grad for param in model.pretrained_tactile_encoder.parameters())
+    assert model.last_diagnostics["pretrained_touch_embedding"].shape == (2, 64)
+    assert model.last_diagnostics["touch_gate"].shape == (2, 3, 1)
+
+
+def test_pretrained_tactile_gated_editor_zeroes_gate_without_valid_right_touch():
+    model = PretrainedTactileGatedResidualEditor(
+        action_dim=12,
+        state_dim=8,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        condition_mode="full",
+        pretrained_touch_encoder=ConstantTactileEncoder(),
+        pretrained_touch_embed_dim=64,
+        pretrained_touch_hand="right",
+    )
+    batch = {
+        "a_base": torch.zeros((2, 3, 12), dtype=torch.float32),
+        "current_state": torch.zeros((2, 8), dtype=torch.float32),
+        "current_state_mask": torch.ones((2, 8), dtype=torch.bool),
+        "touch_pressure": torch.ones((2, 2, 2, 16, 16), dtype=torch.float32),
+        "touch_mask": torch.zeros((2, 2, 2), dtype=torch.bool),
+        "chunk_phase": torch.linspace(0.0, 1.0, 3),
+        "future_mask": torch.ones((2, 3, 12), dtype=torch.float32),
+        "action_mask": torch.ones((2, 3, 12), dtype=torch.bool),
+    }
+
+    _ = model(**batch)
+
+    assert torch.count_nonzero(model.last_diagnostics["touch_gate"]) == 0
+
+
+def test_opentouch_tactile_checkpoint_loader_loads_tactile_branch(tmp_path):
+    source = OpenTouchCNNetEmbedding(emb_dim=64)
+    checkpoint_path = tmp_path / "opentouch_encoder.pt"
+    torch.save(
+        {
+            "state_dict": {
+                f"tactile.{key}": value.clone()
+                for key, value in source.state_dict().items()
+            }
+        },
+        checkpoint_path,
+    )
+
+    model = PretrainedTactileGatedResidualEditor(
+        action_dim=12,
+        state_dim=8,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        pretrained_touch_encoder_checkpoint=checkpoint_path,
+        pretrained_touch_embed_dim=64,
+    )
+
+    for key, value in source.state_dict().items():
+        assert torch.allclose(model.pretrained_tactile_encoder.state_dict()[key], value)
 
 
 def test_hand_scope_action_mask_can_limit_loss_to_right_hand():
@@ -1038,6 +1139,46 @@ def test_load_touch_editor_restores_gated_checkpoint(tmp_path):
     assert loaded.context_dropout_prob == pytest.approx(0.25)
 
 
+def test_load_touch_editor_restores_pretrained_tactile_gated_checkpoint(tmp_path):
+    model = PretrainedTactileGatedResidualEditor(
+        action_dim=12,
+        state_dim=8,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        condition_mode="full",
+        context_dropout_prob=0.25,
+        pretrained_touch_embed_dim=64,
+        pretrained_touch_hand="right",
+    )
+    ckpt = tmp_path / "pretrained_gated.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "args": {
+                "editor_type": "pretrained_tactile_gated",
+                "action_dim": 12,
+                "state_dim": 8,
+                "hidden_dim": 32,
+                "num_layers": 1,
+                "num_heads": 4,
+                "condition_mode": "full",
+                "context_dropout_prob": 0.25,
+                "pretrained_touch_embed_dim": 64,
+                "pretrained_touch_hand": "right",
+                "freeze_pretrained_touch_encoder": True,
+            },
+        },
+        ckpt,
+    )
+
+    loaded = load_touch_editor(ckpt, device="cpu")
+
+    assert isinstance(loaded, PretrainedTactileGatedResidualEditor)
+    assert loaded.pretrained_touch_hand == "right"
+    assert loaded.context_dropout_prob == pytest.approx(0.25)
+
+
 def test_build_touch_editor_selects_gated_model():
     args = SimpleNamespace(
         editor_type="tactile_gated",
@@ -1056,3 +1197,40 @@ def test_build_touch_editor_selects_gated_model():
     assert isinstance(model, TactileGatedResidualEditor)
     assert model.condition_mode == "no_base"
     assert model.context_dropout_prob == pytest.approx(0.25)
+
+
+def test_build_touch_editor_selects_pretrained_tactile_gated_model(tmp_path):
+    source = OpenTouchCNNetEmbedding(emb_dim=64)
+    checkpoint_path = tmp_path / "opentouch_encoder.pt"
+    torch.save(
+        {
+            "state_dict": {
+                f"tactile.{key}": value.clone()
+                for key, value in source.state_dict().items()
+            }
+        },
+        checkpoint_path,
+    )
+    args = SimpleNamespace(
+        editor_type="pretrained_tactile_gated",
+        init_checkpoint=None,
+        action_dim=12,
+        state_dim=8,
+        touch_feature_dim=16,
+        hidden_dim=32,
+        num_layers=1,
+        num_heads=4,
+        condition_mode="full",
+        context_dropout_prob=0.25,
+        pretrained_touch_encoder_checkpoint=checkpoint_path,
+        pretrained_touch_encoder_config=None,
+        pretrained_touch_embed_dim=64,
+        pretrained_touch_hand="right",
+        freeze_pretrained_touch_encoder=True,
+    )
+
+    model = build_touch_editor(args)
+
+    assert isinstance(model, PretrainedTactileGatedResidualEditor)
+    assert model.pretrained_touch_hand == "right"
+    assert not any(param.requires_grad for param in model.pretrained_tactile_encoder.parameters())
